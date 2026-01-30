@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Tesla secrets
+cache.json
+scheduled_charges.json
+*.pem
+
+# Environment
+.env
+.venv/
+venv/
