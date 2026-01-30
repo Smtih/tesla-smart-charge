@@ -313,16 +313,14 @@ class TeslaManager:
         if not self.authenticated:
             return 'Not Authenticated'
         if self.manual_override:
+            # Distinguish scheduled vs manual
+            if self.active_scheduled_charge is not None:
+                return 'Scheduled Charge'
             return 'Manual Override'
-        now = datetime.now()
-        wd = now.weekday()
-        if wd <= 3 or (wd == 4 and now.hour < 20):
-            return 'Top-Off Guard'
-        if (wd == 4 or wd == 5) and now.hour >= 20 and self.overnight_done_day != wd:
-            return 'Overnight Charge'
-        if wd in (5, 6):
-            return 'Weekend Guard'
-        return 'Idle'
+        # Top-Off Guard (runs all week)
+        if self.battery_level is not None and self.battery_level < CHARGE_TRIGGER:
+            return 'Top-Off Guard - Charging'
+        return 'Top-Off Guard'
 
 
 # ---------------------------------------------------------------------------
@@ -492,11 +490,10 @@ def build_auth_ui(mgr: TeslaManager):
 # ---------------------------------------------------------------------------
 MODE_DESCRIPTIONS = {
     'Not Authenticated': 'Sign in to connect your Tesla account',
-    'Manual Override': f'Charging to {WEEKEND_LIMIT}% — will reset to {IDLE_LIMIT}% when full',
-    'Top-Off Guard': f'Charges to {WEEKDAY_LIMIT}% only if battery drops below {CHARGE_TRIGGER}%, then idles at {IDLE_LIMIT}%',
-    'Overnight Charge': f'Will charge to {WEEKEND_LIMIT}% for LFP calibration, then idle at {IDLE_LIMIT}% (skips if above {OVERNIGHT_SKIP}%)',
-    'Weekend Guard': f'Charges to {WEEKDAY_LIMIT}% only if battery drops below {CHARGE_TRIGGER}%, then idles at {IDLE_LIMIT}%',
-    'Idle': 'No active rule — monitoring',
+    'Manual Override': f'Charging to {WEEKEND_LIMIT}% — user initiated. Will reset to {IDLE_LIMIT}% when battery reaches 100%.',
+    'Scheduled Charge': f'Charging to {WEEKEND_LIMIT}% for scheduled time. Will reset to {IDLE_LIMIT}% when complete. Skips if battery ≥{OVERNIGHT_SKIP}%.',
+    'Top-Off Guard': f'Protecting battery from shallow cycles. Charge limit at {IDLE_LIMIT}% until battery drops below {CHARGE_TRIGGER}%.',
+    'Top-Off Guard - Charging': f'Battery below {CHARGE_TRIGGER}% — limit raised to {WEEKDAY_LIMIT}% for one full charge session.',
 }
 
 
