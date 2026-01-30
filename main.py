@@ -579,6 +579,8 @@ def build_ui(mgr: TeslaManager):
                     with time_input.add_slot('append'):
                         ui.icon('access_time').on('click', time_menu.open).classes('cursor-pointer')
 
+                repeat_checkbox = ui.checkbox('Repeat weekly').classes('mb-2')
+
                 async def on_schedule():
                     try:
                         t = time_input.value or '20:00'
@@ -586,11 +588,21 @@ def build_ui(mgr: TeslaManager):
                         if dt <= datetime.now():
                             mgr._log('Schedule failed — date/time is in the past')
                             return
-                        mgr.scheduled_charges.append(dt)
-                        mgr.scheduled_charges.sort()
+
+                        # Create schedule with repeat flag
+                        new_schedule = {
+                            "time": dt.isoformat(),
+                            "repeat_weekly": repeat_checkbox.value
+                        }
+                        mgr.scheduled_charges.append(new_schedule)
+                        mgr.scheduled_charges.sort(key=lambda s: s["time"])
                         mgr._save_scheduled_charges()
-                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %Y-%m-%d %H:%M")}')
+
+                        repeat_text = " (repeating weekly)" if repeat_checkbox.value else ""
+                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %Y-%m-%d %H:%M")}{repeat_text}')
+
                         date_input.set_value('')
+                        repeat_checkbox.value = False  # Reset checkbox
 
                         # Check if we need to start charging immediately
                         time_until = (dt - datetime.now()).total_seconds() / 60
@@ -607,6 +619,7 @@ def build_ui(mgr: TeslaManager):
                                     await mgr.set_charge_limit(WEEKEND_LIMIT)
                                     await mgr.start_charging()
                                     mgr.manual_override = True
+                                    mgr.active_scheduled_charge = new_schedule
                                     mgr._log(f'Starting now — need {percent_needed}% in {int(time_until)} min')
                     except ValueError:
                         mgr._log('Schedule failed — invalid date or time format')
@@ -614,27 +627,6 @@ def build_ui(mgr: TeslaManager):
                 ui.button('Schedule', on_click=on_schedule, icon='schedule').classes('bg-green-600 hover:bg-green-700')
 
             schedule_container = ui.column().classes('w-full gap-2 mt-3')
-
-        # --- Behaviour Info ---
-        with ui.expansion('How charging works', icon='info').classes('w-full bg-blue-50 border border-blue-200'):
-            ui.markdown(f'''
-**Default behaviour (Top-Off Guard)**
-- Charge limit kept at {IDLE_LIMIT}% to prevent the car auto-charging when plugged in
-- When battery drops below {CHARGE_TRIGGER}%, limit raised to {WEEKDAY_LIMIT}% for one full session
-- Once charged, limit drops back to {IDLE_LIMIT}%
-
-**Friday & Saturday at 8 PM (Overnight Charge)**
-- Charges to 100% for weekend use and LFP calibration
-- Once charged, limit resets to {IDLE_LIMIT}% to prevent micro top-offs
-- Only triggers once per night — if you unplug and replug, default behaviour resumes
-- Skipped if battery is already above {OVERNIGHT_SKIP}%
-
-**Charge Now / Scheduled Charges**
-- Charges to 100%, then automatically resets to {IDLE_LIMIT}% when full
-
-**How often does it check?**
-- Every {CHECK_INTERVAL // 60} minutes — the car is only woken when an action is needed
-''').classes('text-sm')
 
         # --- Action Log ---
         with ui.card().classes('w-full p-3 sm:p-4'):
@@ -664,13 +656,18 @@ def build_ui(mgr: TeslaManager):
                     for sc in mgr.scheduled_charges:
                         with ui.card().classes('w-full p-2'):
                             with ui.row().classes('items-center gap-3 w-full'):
-                                ui.icon('schedule').classes('text-green-600')
-                                ui.label(sc.strftime('%a %Y-%m-%d %H:%M')).classes('text-sm font-mono flex-1')
-                                dt_to_remove = sc
-                                ui.button(icon='delete', on_click=lambda _, d=dt_to_remove: (
-                                    mgr.scheduled_charges.remove(d),
+                                # Icon: repeat if weekly, schedule if one-time
+                                icon_name = 'repeat' if sc.get('repeat_weekly', False) else 'schedule'
+                                icon_color = 'text-blue-600' if sc.get('repeat_weekly', False) else 'text-green-600'
+                                ui.icon(icon_name).classes(icon_color)
+
+                                schedule_time = datetime.fromisoformat(sc["time"])
+                                ui.label(schedule_time.strftime('%a %Y-%m-%d %H:%M')).classes('text-sm font-mono flex-1')
+
+                                ui.button(icon='delete', on_click=lambda _, s=sc: (
+                                    mgr.scheduled_charges.remove(s),
                                     mgr._save_scheduled_charges(),
-                                    mgr._log(f'Removed scheduled charge for {d.strftime("%a %Y-%m-%d %H:%M")}'),
+                                    mgr._log(f'Removed schedule for {datetime.fromisoformat(s["time"]).strftime("%a %Y-%m-%d %H:%M")}'),
                                 )).props('flat dense size=sm').classes('text-red-600')
 
             log_container.clear()
