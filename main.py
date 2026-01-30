@@ -145,8 +145,7 @@ class TeslaManager:
 
     def _save_scheduled_charges(self):
         try:
-            data = [d.isoformat() for d in self.scheduled_charges]
-            self._schedule_file.write_text(json.dumps(data))
+            self._schedule_file.write_text(json.dumps(self.scheduled_charges))
         except Exception:
             pass
 
@@ -346,10 +345,6 @@ async def charge_loop(mgr: TeslaManager):
                 first_run = False
 
             now = datetime.now()
-            wd = now.weekday()
-
-            if wd == 0:
-                mgr.overnight_done_day = None
 
             # --- Reset to idle when unplugged ---
             if mgr.charge_state == 'Disconnected':
@@ -369,14 +364,14 @@ async def charge_loop(mgr: TeslaManager):
                         mgr._log(f'Unplugged at {mgr.battery_level}% (low) — set limit to {WEEKDAY_LIMIT}%')
 
             # --- Rule 0: Scheduled Charges ---
-            # Check if we need to start charging to be done by scheduled time
             if mgr.scheduled_charges and not mgr.manual_override:
-                next_charge = mgr.scheduled_charges[0]
-                time_until = (next_charge - now).total_seconds() / 60  # minutes
+                next_schedule = mgr.scheduled_charges[0]
+                next_time = datetime.fromisoformat(next_schedule["time"])
+                time_until = (next_time - now).total_seconds() / 60  # minutes
 
-                # Remove if scheduled time has passed without starting
+                # Remove if scheduled time has passed
                 if time_until < 0:
-                    mgr._log(f'Scheduled charge time passed ({next_charge.strftime("%a %H:%M")}) — removing from schedule')
+                    mgr._log(f'Scheduled charge time passed ({next_time.strftime("%a %H:%M")}) — removing from schedule')
                     mgr.scheduled_charges.pop(0)
                     mgr._save_scheduled_charges()
                 else:
@@ -388,84 +383,57 @@ async def charge_loop(mgr: TeslaManager):
                         # Skip if battery already high enough AND close to scheduled time
                         if mgr.battery_level >= OVERNIGHT_SKIP and time_until <= 30:
                             mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), skipping')
-                            # Remove this scheduled charge
                             mgr.scheduled_charges.pop(0)
                             mgr._save_scheduled_charges()
                         elif mgr.battery_level >= OVERNIGHT_SKIP:
-                            # Battery high but still time - might drive before scheduled time
-                            mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (high), monitoring until {next_charge.strftime("%H:%M")}')
+                            mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (high), monitoring until {next_time.strftime("%H:%M")}')
                         else:
-                            # Conservative estimate: 2 minutes per 1% charge + 30 min buffer
                             percent_needed = 100 - mgr.battery_level
                             minutes_needed = (percent_needed * 2) + 30
 
                             if time_until <= minutes_needed:
-                                # Start charging now to be done by scheduled time
                                 await mgr.set_charge_limit(WEEKEND_LIMIT)
                                 await mgr.start_charging()
                                 mgr.manual_override = True
-                                mgr._log(f'Scheduled charge started — need {percent_needed}% in {int(time_until)} min, done by {next_charge.strftime("%a %H:%M")}')
+                                mgr.active_scheduled_charge = next_schedule
+                                mgr._log(f'Scheduled charge started — need {percent_needed}% in {int(time_until)} min, done by {next_time.strftime("%a %H:%M")}')
 
-            # Remove completed scheduled charges
-            if mgr.manual_override and mgr.battery_level is not None and mgr.battery_level >= 100:
-                if mgr.scheduled_charges and now >= mgr.scheduled_charges[0]:
-                    completed = mgr.scheduled_charges.pop(0)
-                    mgr._save_scheduled_charges()
-                    mgr._log(f'Scheduled charge complete — removing {completed.strftime("%a %H:%M")}')
-
-            # --- Rule 1: Manual Override ---
+            # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
                 await mgr.refresh_state()
                 if mgr.battery_level is not None and mgr.battery_level >= 100:
+                    # Check if this was a scheduled charge
+                    if mgr.active_scheduled_charge:
+                        schedule = mgr.active_scheduled_charge
+                        schedule_time = datetime.fromisoformat(schedule["time"])
+
+                        # If it's a repeating schedule, create next instance
+                        if schedule.get("repeat_weekly", False):
+                            next_time = schedule_time + timedelta(days=7)
+                            new_schedule = {
+                                "time": next_time.isoformat(),
+                                "repeat_weekly": True
+                            }
+                            mgr.scheduled_charges.append(new_schedule)
+                            mgr.scheduled_charges.sort(key=lambda s: s["time"])
+                            mgr._log(f'Repeating schedule — created next instance for {next_time.strftime("%a %H:%M")}')
+
+                        # Remove completed schedule
+                        if schedule in mgr.scheduled_charges:
+                            mgr.scheduled_charges.remove(schedule)
+                            mgr._save_scheduled_charges()
+
+                        mgr.active_scheduled_charge = None
+
+                    # Reset to idle limit
                     await mgr.set_charge_limit(IDLE_LIMIT)
                     mgr.manual_override = False
-                    mgr._log(f'Override complete — battery at 100%, limit set to {IDLE_LIMIT}%')
+                    mgr._log(f'Charge complete — battery at 100%, limit set to {IDLE_LIMIT}%')
                 else:
                     mgr._log(f'Override active — battery at {mgr.battery_level}%')
 
-            # --- Rule 2: Overnight Charge (Fri/Sat >= 20:00) ---
-            # Charge to 100% overnight so the car is full for weekend mornings,
-            # but skip if battery is already high enough.
-            elif (wd == 4 or wd == 5) and now.hour >= 20 and mgr.overnight_done_day != wd:
-                day = 'Friday' if wd == 4 else 'Saturday'
-                await mgr.refresh_state()
-                if mgr.battery_level is not None and mgr.battery_level >= OVERNIGHT_SKIP:
-                    mgr._log(f'{day} overnight — battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), skipping')
-                elif mgr.charge_limit != WEEKEND_LIMIT:
-                    await mgr.set_charge_limit(WEEKEND_LIMIT)
-                    await mgr.start_charging()
-                    mgr.overnight_done_day = wd
-                    mgr._log(f'{day} overnight — set 100% and started charging')
-                else:
-                    mgr.overnight_done_day = wd
-                    mgr._log(f'{day} overnight — limit already 100%, car sleeping')
-
-            # --- Rule 3: Weekend Daytime (same hysteresis as weekdays) ---
-            elif wd in (5, 6):
-                if mgr.battery_level is None:
-                    mgr._log('Weekend — no battery data, skipping')
-                elif mgr.battery_level >= NO_CHARGE_ABOVE:
-                    if mgr.charge_limit != IDLE_LIMIT:
-                        await mgr.set_charge_limit(IDLE_LIMIT)
-                        mgr._log(f'Weekend — battery at {mgr.battery_level}%, limit set to {IDLE_LIMIT}%')
-                    else:
-                        mgr._log(f'Weekend — battery at {mgr.battery_level}%, all good')
-                elif mgr.battery_level < CHARGE_TRIGGER:
-                    if mgr.charge_limit != WEEKDAY_LIMIT:
-                        await mgr.refresh_state()
-                        await mgr.set_charge_limit(WEEKDAY_LIMIT)
-                        mgr._log(f'Weekend — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
-                    else:
-                        mgr._log(f'Weekend — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%, car sleeping')
-                else:
-                    mgr._log(f'Weekend — battery at {mgr.battery_level}% (hysteresis zone), no charge triggered')
-
-            # --- Rule 4: Top-Off Guard (Mon-Thu + Friday before 8 PM) ---
-            # LFP strategy: avoid shallow top-end cycles. Only charge when
-            # SOC drops meaningfully (below CHARGE_TRIGGER). Never start a
-            # charge if SOC is above NO_CHARGE_ABOVE. One longer session
-            # instead of many short top-offs.
-            elif 0 <= wd <= 3 or (wd == 4 and now.hour < 20):
+            # --- Rule 2: Top-Off Guard (runs 7 days a week) ---
+            elif not mgr.manual_override:
                 if mgr.battery_level is None:
                     mgr._log('Top-off guard — no battery data, skipping')
                 elif mgr.battery_level >= NO_CHARGE_ABOVE:
@@ -475,16 +443,14 @@ async def charge_loop(mgr: TeslaManager):
                     else:
                         mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, all good')
                 elif mgr.battery_level < CHARGE_TRIGGER:
-                    # SOC dropped meaningfully — allow one full charge to 80%
                     if mgr.charge_limit != WEEKDAY_LIMIT:
                         await mgr.refresh_state()
                         await mgr.set_charge_limit(WEEKDAY_LIMIT)
                         mgr._log(f'Top-off guard — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
                     else:
-                        mgr._log(f'Top-off guard — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%, car sleeping')
+                        mgr._log(f'Top-off guard — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%')
                 else:
-                    # Between CHARGE_TRIGGER and NO_CHARGE_ABOVE — don't start new charge
-                    mgr._log(f'Top-off guard — battery at {mgr.battery_level}% (hysteresis zone), no charge triggered')
+                    mgr._log(f'Top-off guard — battery at {mgr.battery_level}% (hysteresis zone)')
 
             else:
                 mgr._log('No matching rule, idle')
