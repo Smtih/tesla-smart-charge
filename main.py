@@ -4,7 +4,7 @@ import logging
 import logging.handlers
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from urllib.parse import urlencode
@@ -113,9 +113,34 @@ class TeslaManager:
         try:
             if self._schedule_file.exists():
                 data = json.loads(self._schedule_file.read_text())
-                self.scheduled_charges = [datetime.fromisoformat(d) for d in data]
-                self.scheduled_charges.sort()
-        except Exception:
+                # Check if old format (list of strings)
+                if data and isinstance(data[0], str):
+                    # Archive old format
+                    old_file = self._schedule_file.with_suffix('.json.old')
+                    self._schedule_file.rename(old_file)
+                    self._log(f'Archived old schedule format to {old_file.name}')
+                    data = None  # Force prefill
+                else:
+                    self.scheduled_charges = data
+                    return
+
+            # Prefill with Saturday & Sunday 8am repeating schedules
+            now = datetime.now()
+            # Find next Saturday
+            days_until_sat = (5 - now.weekday()) % 7
+            if days_until_sat == 0 and now.hour >= 8:
+                days_until_sat = 7  # Already past this Saturday 8am
+            next_sat = (now + timedelta(days=days_until_sat)).replace(hour=8, minute=0, second=0, microsecond=0)
+            next_sun = next_sat + timedelta(days=1)
+
+            self.scheduled_charges = [
+                {"time": next_sat.isoformat(), "repeat_weekly": True},
+                {"time": next_sun.isoformat(), "repeat_weekly": True}
+            ]
+            self._save_scheduled_charges()
+            self._log('Prefilled Saturday & Sunday 8am repeating schedules')
+        except Exception as e:
+            self._log(f'Error loading schedules: {e}')
             self.scheduled_charges = []
 
     def _save_scheduled_charges(self):
