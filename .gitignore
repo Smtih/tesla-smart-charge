@@ -5,8 +5,12 @@ __pycache__/
 dist/
 build/
 
+#logs
+*.log
+
 # Tesla secrets
 cache.json
+token.json
 scheduled_charges.json
 *.pem
 

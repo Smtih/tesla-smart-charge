@@ -21,10 +21,21 @@ from tesla_fleet_api.const import Scope
 CHECK_INTERVAL = 1800  # 30 minutes
 WEEKDAY_LIMIT = 75
 WEEKEND_LIMIT = 100
-CHARGE_TRIGGER = 40       # Only start a weekday charge when SOC drops below this
+CHARGE_TRIGGER = 55       # Only start a weekday charge when SOC drops below this
 NO_CHARGE_ABOVE = 75      # Never trigger a charge if SOC is above this (dead-zone / hysteresis)
-IDLE_LIMIT = 30           # Resting charge limit — prevents car from auto-charging when plugged in
+IDLE_LIMIT = 50           # Resting charge limit — prevents car from auto-charging when plugged in
 OVERNIGHT_SKIP = 90       # Skip overnight 100% charge if SOC is already above this
+# Charging estimate: LFP Model Y on 10A / 230V wall charger (~2.3 kW)
+BATTERY_CAPACITY_KWH = 60
+CHARGER_POWER_KW = 2.3    # 10A × 230V
+CHARGE_EFFICIENCY = 0.90   # ~10% AC conversion / heat losses
+CHARGE_BUFFER_MIN = 30     # Extra time for cell balancing at top end
+
+def _estimate_charge_minutes(percent_needed: float) -> float:
+    """Estimate minutes to charge `percent_needed`% on a 10A wall charger."""
+    kwh_needed = BATTERY_CAPACITY_KWH * (percent_needed / 100)
+    effective_kw = CHARGER_POWER_KW * CHARGE_EFFICIENCY
+    return (kwh_needed / effective_kw) * 60 + CHARGE_BUFFER_MIN
 TESLA_EMAIL = 'smith.w.da@gmail.com'
 TESLA_CLIENT_ID = '46b3b38b-c7c1-4015-9f6d-51bcaf2729b3'
 def _load_client_secret() -> str:
@@ -387,14 +398,14 @@ async def charge_loop(mgr: TeslaManager):
                             mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (high), monitoring until {next_time.strftime("%H:%M")}')
                         else:
                             percent_needed = 100 - mgr.battery_level
-                            minutes_needed = (percent_needed * 2) + 30
+                            minutes_needed = _estimate_charge_minutes(percent_needed)
 
                             if time_until <= minutes_needed:
                                 await mgr.set_charge_limit(WEEKEND_LIMIT)
                                 await mgr.start_charging()
                                 mgr.manual_override = True
                                 mgr.active_scheduled_charge = next_schedule
-                                mgr._log(f'Scheduled charge started — need {percent_needed}% in {int(time_until)} min, done by {next_time.strftime("%a %H:%M")}')
+                                mgr._log(f'Scheduled charge started — need {percent_needed}% (~{int(minutes_needed)} min) in {int(time_until)} min, done by {next_time.strftime("%a %H:%M")}')
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
@@ -614,7 +625,7 @@ def build_ui(mgr: TeslaManager):
                                 mgr._log(f'Battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), charge not needed')
                             else:
                                 percent_needed = 100 - mgr.battery_level
-                                minutes_needed = (percent_needed * 2) + 30
+                                minutes_needed = _estimate_charge_minutes(percent_needed)
                                 if time_until <= minutes_needed:
                                     await mgr.set_charge_limit(WEEKEND_LIMIT)
                                     await mgr.start_charging()

@@ -10,10 +10,17 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 5) `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $env:USERNAME `
+    -LogonType S4U `
+    -RunLevel Highest
+
+Unregister-ScheduledTask -TaskName 'Tesla Smart-Charge' -Confirm:$false -ErrorAction SilentlyContinue
+
 Register-ScheduledTask `
     -TaskName 'Tesla Smart-Charge' `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -RunLevel Highest `
+    -Principal $principal `
     -Description 'Tesla Smart-Charge Daycare-Proof Manager'
