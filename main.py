@@ -1,45 +1,101 @@
 import asyncio
 import json
 import logging
+import logging.handlers
+import os
+import time
 from datetime import datetime
 from pathlib import Path
 
-import teslapy
+from urllib.parse import urlencode
+
+import aiohttp
+
 from nicegui import app, ui
+from tesla_fleet_api import TeslaFleetOAuth
+from tesla_fleet_api.const import Scope
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 CHECK_INTERVAL = 1800  # 30 minutes
-WEEKDAY_LIMIT = 80
+WEEKDAY_LIMIT = 75
 WEEKEND_LIMIT = 100
-DAYCARE_THRESHOLD = 50
+CHARGE_TRIGGER = 40       # Only start a weekday charge when SOC drops below this
+NO_CHARGE_ABOVE = 75      # Never trigger a charge if SOC is above this (dead-zone / hysteresis)
+IDLE_LIMIT = 30           # Resting charge limit — prevents car from auto-charging when plugged in
+OVERNIGHT_SKIP = 90       # Skip overnight 100% charge if SOC is already above this
 TESLA_EMAIL = 'smith.w.da@gmail.com'
 TESLA_CLIENT_ID = '46b3b38b-c7c1-4015-9f6d-51bcaf2729b3'
-TESLA_REDIRECT_URI = 'https://auth.tesla.com/void/callback'
+def _load_client_secret() -> str:
+    val = os.environ.get('TESLA_CLIENT_SECRET', '')
+    if val:
+        return val
+    env_file = Path(__file__).parent / '.env'
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith('TESLA_CLIENT_SECRET='):
+                return line.split('=', 1)[1].strip()
+    return ''
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(message)s')
+TESLA_CLIENT_SECRET = _load_client_secret()
+TESLA_REDIRECT_URI = 'http://localhost:8080/auth/callback'
+PRIVATE_KEY_PATH = str(Path(__file__).parent / 'private-key.pem')
+TOKEN_FILE = Path(__file__).parent / 'token.json'
+
+LOG_FILE = Path(__file__).parent / 'smart-charge.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s  %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3),
+    ],
+)
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token persistence
+# ---------------------------------------------------------------------------
+def load_tokens() -> dict | None:
+    try:
+        if TOKEN_FILE.exists():
+            return json.loads(TOKEN_FILE.read_text())
+    except Exception:
+        pass
+    return None
+
+
+def save_tokens(access_token: str, refresh_token: str, expires: int):
+    TOKEN_FILE.write_text(json.dumps({
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'expires': expires,
+    }))
 
 
 # ---------------------------------------------------------------------------
 # Tesla Manager
 # ---------------------------------------------------------------------------
 class TeslaManager:
-    def __init__(self, email: str):
-        self.tesla = teslapy.Tesla(email)
-        vehicles = self.tesla.vehicle_list()
-        self.vehicle = vehicles[0]
+    def __init__(self):
+        self.oauth: TeslaFleetOAuth | None = None
+        self.vehicle = None  # VehicleSigned instance
+        self.vin: str | None = None
+        self.session: aiohttp.ClientSession | None = None
+        self.authenticated: bool = False
+        self.init_done: bool = False
 
         # State
         self.battery_level: int | None = None
         self.charge_state: str = 'Unknown'
         self.charge_limit: int | None = None
         self.manual_override: bool = False
-        self.friday_push_sent: bool = False
         self.action_log: list[str] = []
         self.last_error: str | None = None
-        self.scheduled_charges: list[datetime] = []  # one-time 100% charges
+        self.scheduled_charges: list[dict] = []  # Each: {"time": str, "repeat_weekly": bool}
+        self.active_scheduled_charge: dict | None = None  # Track which schedule is currently charging
         self._schedule_file = Path(__file__).parent / 'scheduled_charges.json'
         self._load_scheduled_charges()
 
@@ -52,9 +108,6 @@ class TeslaManager:
         if len(self.action_log) > 100:
             self.action_log.pop()
         log.info(msg)
-
-    def _wake(self):
-        self.vehicle.sync_wake_up()
 
     def _load_scheduled_charges(self):
         try:
@@ -72,47 +125,179 @@ class TeslaManager:
         except Exception:
             pass
 
+    # -- auth ----------------------------------------------------------------
+
+    async def init_api(self):
+        """Initialize the OAuth API and try to restore saved tokens."""
+        self.session = aiohttp.ClientSession()
+        tokens = load_tokens()
+
+        self.oauth = TeslaFleetOAuth(
+            session=self.session,
+            client_id=TESLA_CLIENT_ID,
+            client_secret=TESLA_CLIENT_SECRET,
+            redirect_uri=TESLA_REDIRECT_URI,
+            region='na',
+            access_token=tokens['access_token'] if tokens else None,
+            refresh_token=tokens['refresh_token'] if tokens else None,
+            expires=tokens.get('expires', 0) if tokens else 0,
+        )
+
+        # Load private key for signed commands
+        await self.oauth.get_private_key(PRIVATE_KEY_PATH)
+
+        if tokens:
+            try:
+                await self._setup_vehicle()
+                self.authenticated = True
+                self._log('Restored saved session')
+            except Exception as e:
+                self._log(f'Saved token failed, re-auth needed: {e}')
+                self.authenticated = False
+        self.init_done = True
+
+    def get_login_url(self) -> str:
+        scopes = [Scope.OPENID, Scope.OFFLINE_ACCESS, Scope.VEHICLE_DEVICE_DATA, Scope.VEHICLE_CMDS, Scope.VEHICLE_CHARGING_CMDS]
+        params = urlencode({
+            'response_type': 'code',
+            'client_id': TESLA_CLIENT_ID,
+            'redirect_uri': TESLA_REDIRECT_URI,
+            'scope': ' '.join(scopes),
+            'state': 'login',
+        })
+        return f'https://auth.tesla.com/oauth2/v3/authorize?{params}'
+
+    async def complete_auth(self, code: str):
+        """Exchange authorization code for tokens and set up vehicle."""
+        if not TESLA_CLIENT_SECRET:
+            raise RuntimeError('TESLA_CLIENT_SECRET env var is not set')
+
+        # Exchange code for tokens — use a separate request to avoid JSON content-type
+        async with aiohttp.ClientSession().post(
+            'https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token',
+            data={
+                'grant_type': 'authorization_code',
+                'client_id': TESLA_CLIENT_ID,
+                'client_secret': TESLA_CLIENT_SECRET,
+                'code': code,
+                'redirect_uri': TESLA_REDIRECT_URI,
+            },
+        ) as resp:
+            data = await resp.json()
+            log.info(f'Token response keys: {list(data.keys())}')
+            if not resp.ok:
+                raise RuntimeError(f'Token exchange failed: {data}')
+            if not data.get('refresh_token'):
+                log.warning('No refresh_token in response — sessions will not persist across restarts')
+            self.oauth.refresh_token = data.get('refresh_token')
+            self.oauth._access_token = data['access_token']
+            self.oauth.expires = int(time.time()) + data['expires_in']
+
+        save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
+        await self._setup_vehicle()
+        self.authenticated = True
+        self._log('Authentication complete')
+
+    async def _setup_vehicle(self):
+        """Discover VIN and create a VehicleSigned instance."""
+        # Refresh token if needed
+        if self.oauth.expires < time.time() and self.oauth.refresh_token:
+            await self.oauth.refresh_access_token()
+            save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
+
+        resp = await self.oauth.products()
+        products = resp.get('response', [])
+        vehicles = [p for p in products if 'vin' in p]
+        if not vehicles:
+            raise RuntimeError('No vehicles found on account')
+        self.vin = vehicles[0]['vin']
+        self.vehicle = self.oauth.vehicles.createSigned(self.vin)
+        self._log(f'Vehicle ready: {self.vin}')
+
+    async def _ensure_token(self):
+        """Refresh access token if expired, and persist."""
+        if self.oauth.expires < time.time():
+            if not self.oauth.refresh_token:
+                self.authenticated = False
+                raise RuntimeError('Token expired and no refresh token — please re-authenticate')
+            try:
+                await self.oauth.refresh_access_token()
+                save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
+            except Exception as e:
+                self.authenticated = False
+                raise RuntimeError(f'Token refresh failed — please re-authenticate: {e}')
+
     # -- API wrappers --------------------------------------------------------
 
-    def refresh_state(self):
-        self._wake()
-        data = self.vehicle.get_vehicle_data()
-        cs = data['charge_state']
+    async def _wake(self):
+        """Wake the vehicle — sends empty JSON body to satisfy Content-Type requirement."""
+        await self._ensure_token()
+        token = await self.oauth.access_token()
+        async with self.session.post(
+            f'{self.oauth.server}/api/1/vehicles/{self.vin}/wake_up',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={},
+        ) as resp:
+            if not resp.ok:
+                text = await resp.text()
+                raise RuntimeError(f'wake_up failed ({resp.status}): {text}')
+
+    async def refresh_state(self):
+        await self._ensure_token()
+        await self._wake()
+        # Wait for vehicle to come online
+        from tesla_fleet_api.exceptions import VehicleOffline
+        for attempt in range(12):
+            try:
+                data = await self.vehicle.vehicle_data(
+                    endpoints=['charge_state']
+                )
+                break
+            except VehicleOffline:
+                if attempt == 11:
+                    raise
+                await asyncio.sleep(5)
+        cs = data['response']['charge_state']
         self.battery_level = cs['battery_level']
-        self.charge_state = cs['charging_state']  # Charging, Stopped, Disconnected, Complete
+        self.charge_state = cs['charging_state']
         self.charge_limit = cs['charge_limit_soc']
         self.last_error = None
 
-    def set_charge_limit(self, pct: int):
-        self._wake()
-        self.vehicle.command('CHANGE_CHARGE_LIMIT', percent=pct)
+    async def set_charge_limit(self, pct: int):
+        await self._ensure_token()
+        await self._wake()
+        await self.vehicle.set_charge_limit(percent=pct)
         self.charge_limit = pct
         self._log(f'Set charge limit to {pct}%')
 
-    def start_charging(self):
-        self._wake()
-        self.vehicle.command('START_CHARGE')
+    async def start_charging(self):
+        await self._ensure_token()
+        await self._wake()
+        await self.vehicle.charge_start()
         self._log('Sent start charging command')
 
-    def stop_charging(self):
-        self._wake()
-        self.vehicle.command('STOP_CHARGE')
+    async def stop_charging(self):
+        await self._ensure_token()
+        await self._wake()
+        await self.vehicle.charge_stop()
         self._log('Sent stop charging command')
 
     # -- active mode label ---------------------------------------------------
 
     @property
     def active_mode(self) -> str:
+        if not self.authenticated:
+            return 'Not Authenticated'
         if self.manual_override:
             return 'Manual Override'
         now = datetime.now()
-        wd = now.weekday()  # 0=Mon
+        wd = now.weekday()
         if wd <= 3 or (wd == 4 and now.hour < 20):
-            return 'Daycare Protection'
-        if wd == 4 and now.hour >= 20:
-            return 'Friday Push'
+            return 'Top-Off Guard'
+        if (wd == 4 or wd == 5) and now.hour >= 20 and self.overnight_done_day != wd:
+            return 'Overnight Charge'
         if wd in (5, 6):
-            return 'Weekend Hold'
+            return 'Weekend Guard'
         return 'Idle'
 
 
@@ -120,104 +305,161 @@ class TeslaManager:
 # Background charge loop
 # ---------------------------------------------------------------------------
 async def charge_loop(mgr: TeslaManager):
+    # Wait for authentication
+    while not mgr.authenticated:
+        await asyncio.sleep(5)
+
     first_run = True
     while True:
         try:
-            # Always refresh on first run so rules have real data
             if first_run:
                 try:
-                    mgr.refresh_state()
+                    await mgr.refresh_state()
                     mgr._log('Startup — fetched initial state')
                 except Exception as e:
                     mgr._log(f'Startup refresh failed: {e} — will retry next cycle')
                 first_run = False
 
             now = datetime.now()
-            wd = now.weekday()  # 0=Mon .. 6=Sun
-            needs_wake = False
+            wd = now.weekday()
 
-            # Reset friday flag on Monday
             if wd == 0:
-                mgr.friday_push_sent = False
+                mgr.overnight_done_day = None
+
+            # --- Reset to idle when unplugged ---
+            if mgr.charge_state == 'Disconnected':
+                # Exit manual override if unplugged
+                if mgr.manual_override:
+                    mgr.manual_override = False
+                    mgr._log('Unplugged during manual override — reverting to automatic mode')
+
+                # Set appropriate charge limit based on battery level
+                if mgr.battery_level is not None and mgr.battery_level >= CHARGE_TRIGGER:
+                    if mgr.charge_limit is not None and mgr.charge_limit != IDLE_LIMIT:
+                        await mgr.set_charge_limit(IDLE_LIMIT)
+                        mgr._log(f'Unplugged at {mgr.battery_level}% — reset limit to {IDLE_LIMIT}%')
+                elif mgr.battery_level is not None and mgr.battery_level < CHARGE_TRIGGER:
+                    if mgr.charge_limit is not None and mgr.charge_limit != WEEKDAY_LIMIT:
+                        await mgr.set_charge_limit(WEEKDAY_LIMIT)
+                        mgr._log(f'Unplugged at {mgr.battery_level}% (low) — set limit to {WEEKDAY_LIMIT}%')
 
             # --- Rule 0: Scheduled Charges ---
-            triggered = [s for s in mgr.scheduled_charges if s <= now]
-            if triggered:
-                for s in triggered:
-                    mgr.scheduled_charges.remove(s)
-                mgr.refresh_state()
-                mgr.set_charge_limit(WEEKEND_LIMIT)
-                mgr.start_charging()
-                mgr.manual_override = True
-                mgr._save_scheduled_charges()
-                mgr._log(f'Scheduled charge triggered — charging to 100%')
+            # Check if we need to start charging to be done by scheduled time
+            if mgr.scheduled_charges and not mgr.manual_override:
+                next_charge = mgr.scheduled_charges[0]
+                time_until = (next_charge - now).total_seconds() / 60  # minutes
+
+                # Remove if scheduled time has passed without starting
+                if time_until < 0:
+                    mgr._log(f'Scheduled charge time passed ({next_charge.strftime("%a %H:%M")}) — removing from schedule')
+                    mgr.scheduled_charges.pop(0)
+                    mgr._save_scheduled_charges()
+                else:
+                    # Get current battery level
+                    if mgr.battery_level is None:
+                        await mgr.refresh_state()
+
+                    if mgr.battery_level is not None:
+                        # Skip if battery already high enough AND close to scheduled time
+                        if mgr.battery_level >= OVERNIGHT_SKIP and time_until <= 30:
+                            mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), skipping')
+                            # Remove this scheduled charge
+                            mgr.scheduled_charges.pop(0)
+                            mgr._save_scheduled_charges()
+                        elif mgr.battery_level >= OVERNIGHT_SKIP:
+                            # Battery high but still time - might drive before scheduled time
+                            mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (high), monitoring until {next_charge.strftime("%H:%M")}')
+                        else:
+                            # Conservative estimate: 2 minutes per 1% charge + 30 min buffer
+                            percent_needed = 100 - mgr.battery_level
+                            minutes_needed = (percent_needed * 2) + 30
+
+                            if time_until <= minutes_needed:
+                                # Start charging now to be done by scheduled time
+                                await mgr.set_charge_limit(WEEKEND_LIMIT)
+                                await mgr.start_charging()
+                                mgr.manual_override = True
+                                mgr._log(f'Scheduled charge started — need {percent_needed}% in {int(time_until)} min, done by {next_charge.strftime("%a %H:%M")}')
+
+            # Remove completed scheduled charges
+            if mgr.manual_override and mgr.battery_level is not None and mgr.battery_level >= 100:
+                if mgr.scheduled_charges and now >= mgr.scheduled_charges[0]:
+                    completed = mgr.scheduled_charges.pop(0)
+                    mgr._save_scheduled_charges()
+                    mgr._log(f'Scheduled charge complete — removing {completed.strftime("%a %H:%M")}')
 
             # --- Rule 1: Manual Override ---
             if mgr.manual_override:
-                needs_wake = True
-                mgr.refresh_state()
+                await mgr.refresh_state()
                 if mgr.battery_level is not None and mgr.battery_level >= 100:
-                    mgr.set_charge_limit(WEEKDAY_LIMIT)
+                    await mgr.set_charge_limit(IDLE_LIMIT)
                     mgr.manual_override = False
-                    mgr._log('Override complete — battery at 100%, reset to 80%')
+                    mgr._log(f'Override complete — battery at 100%, limit set to {IDLE_LIMIT}%')
                 else:
                     mgr._log(f'Override active — battery at {mgr.battery_level}%')
 
-            # --- Rule 2: Friday Push ---
-            elif wd == 4 and now.hour >= 20 and not mgr.friday_push_sent:
-                needs_wake = True
-                mgr.refresh_state()
-                mgr.set_charge_limit(WEEKEND_LIMIT)
-                mgr.start_charging()
-                mgr.friday_push_sent = True
-                mgr._log('Friday push — set 100% and started charging')
+            # --- Rule 2: Overnight Charge (Fri/Sat >= 20:00) ---
+            # Charge to 100% overnight so the car is full for weekend mornings,
+            # but skip if battery is already high enough.
+            elif (wd == 4 or wd == 5) and now.hour >= 20 and mgr.overnight_done_day != wd:
+                day = 'Friday' if wd == 4 else 'Saturday'
+                await mgr.refresh_state()
+                if mgr.battery_level is not None and mgr.battery_level >= OVERNIGHT_SKIP:
+                    mgr._log(f'{day} overnight — battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), skipping')
+                elif mgr.charge_limit != WEEKEND_LIMIT:
+                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                    await mgr.start_charging()
+                    mgr.overnight_done_day = wd
+                    mgr._log(f'{day} overnight — set 100% and started charging')
+                else:
+                    mgr.overnight_done_day = wd
+                    mgr._log(f'{day} overnight — limit already 100%, car sleeping')
 
-            # --- Rule 3: Weekend Hold ---
-            elif wd == 5 or (wd == 6 and now.hour < 22):
-                # Only wake if we think limit might not be 100%
-                if mgr.charge_limit != WEEKEND_LIMIT:
-                    needs_wake = True
-                    mgr.refresh_state()
-                    if mgr.charge_limit != WEEKEND_LIMIT:
-                        mgr.set_charge_limit(WEEKEND_LIMIT)
-                        mgr._log('Weekend hold — ensured limit at 100%')
+            # --- Rule 3: Weekend Daytime (same hysteresis as weekdays) ---
+            elif wd in (5, 6):
+                if mgr.battery_level is None:
+                    mgr._log('Weekend — no battery data, skipping')
+                elif mgr.battery_level >= NO_CHARGE_ABOVE:
+                    if mgr.charge_limit != IDLE_LIMIT:
+                        await mgr.set_charge_limit(IDLE_LIMIT)
+                        mgr._log(f'Weekend — battery at {mgr.battery_level}%, limit set to {IDLE_LIMIT}%')
                     else:
-                        mgr._log('Weekend hold — limit already 100%, no action')
-                else:
-                    mgr._log('Weekend hold — limit already 100%, car sleeping')
-
-            # --- Rule 4: Smart Reset (Sunday >= 22:00) ---
-            elif wd == 6 and now.hour >= 22:
-                needs_wake = True
-                mgr.refresh_state()
-                if mgr.battery_level is not None and mgr.battery_level >= 100:
-                    mgr.set_charge_limit(WEEKDAY_LIMIT)
-                    mgr._log('Smart reset — battery full, limit reset to 80% for Monday')
-                else:
-                    mgr._log(f'Sunday night — battery at {mgr.battery_level}%, keeping 100% limit')
-
-            # --- Rule 5: Daycare Protection (Mon-Thu + Friday before 8 PM) ---
-            elif 0 <= wd <= 3 or (wd == 4 and now.hour < 20):
-                if mgr.battery_level is not None and mgr.battery_level < DAYCARE_THRESHOLD:
-                    # Low battery — allow charging up to 80%
+                        mgr._log(f'Weekend — battery at {mgr.battery_level}%, all good')
+                elif mgr.battery_level < CHARGE_TRIGGER:
                     if mgr.charge_limit != WEEKDAY_LIMIT:
-                        needs_wake = True
-                        mgr.refresh_state()
-                        mgr.set_charge_limit(WEEKDAY_LIMIT)
-                        mgr._log(f'Daycare — battery {mgr.battery_level}% < 50%, set limit 80%')
+                        await mgr.refresh_state()
+                        await mgr.set_charge_limit(WEEKDAY_LIMIT)
+                        mgr._log(f'Weekend — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
                     else:
-                        mgr._log(f'Daycare — battery low, limit already 80%, car sleeping')
-                elif mgr.battery_level is not None:
-                    # Above threshold — cap at 50% to prevent unwanted charging
-                    if mgr.charge_limit != DAYCARE_THRESHOLD:
-                        needs_wake = True
-                        mgr.refresh_state()
-                        mgr.set_charge_limit(DAYCARE_THRESHOLD)
-                        mgr._log(f'Daycare — battery {mgr.battery_level}% >= 50%, capped limit to 50%')
-                    else:
-                        mgr._log(f'Daycare — battery at {mgr.battery_level}%, limit already 50%, car sleeping')
+                        mgr._log(f'Weekend — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%, car sleeping')
                 else:
-                    mgr._log('Daycare — no battery data, skipping')
+                    mgr._log(f'Weekend — battery at {mgr.battery_level}% (hysteresis zone), no charge triggered')
+
+            # --- Rule 4: Top-Off Guard (Mon-Thu + Friday before 8 PM) ---
+            # LFP strategy: avoid shallow top-end cycles. Only charge when
+            # SOC drops meaningfully (below CHARGE_TRIGGER). Never start a
+            # charge if SOC is above NO_CHARGE_ABOVE. One longer session
+            # instead of many short top-offs.
+            elif 0 <= wd <= 3 or (wd == 4 and now.hour < 20):
+                if mgr.battery_level is None:
+                    mgr._log('Top-off guard — no battery data, skipping')
+                elif mgr.battery_level >= NO_CHARGE_ABOVE:
+                    if mgr.charge_limit != IDLE_LIMIT:
+                        await mgr.set_charge_limit(IDLE_LIMIT)
+                        mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, limit set to {IDLE_LIMIT}%')
+                    else:
+                        mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, all good')
+                elif mgr.battery_level < CHARGE_TRIGGER:
+                    # SOC dropped meaningfully — allow one full charge to 80%
+                    if mgr.charge_limit != WEEKDAY_LIMIT:
+                        await mgr.refresh_state()
+                        await mgr.set_charge_limit(WEEKDAY_LIMIT)
+                        mgr._log(f'Top-off guard — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
+                    else:
+                        mgr._log(f'Top-off guard — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%, car sleeping')
+                else:
+                    # Between CHARGE_TRIGGER and NO_CHARGE_ABOVE — don't start new charge
+                    mgr._log(f'Top-off guard — battery at {mgr.battery_level}% (hysteresis zone), no charge triggered')
 
             else:
                 mgr._log('No matching rule, idle')
@@ -231,126 +473,185 @@ async def charge_loop(mgr: TeslaManager):
 
 
 # ---------------------------------------------------------------------------
+# NiceGUI Auth Page
+# ---------------------------------------------------------------------------
+def build_auth_ui(mgr: TeslaManager):
+    with ui.column().classes('w-full max-w-md mx-auto p-8 gap-4'):
+        ui.label('Tesla Smart-Charge Manager').classes('text-2xl font-bold')
+        ui.label('Sign in to connect your Tesla').classes('text-gray-500')
+
+        login_url = mgr.get_login_url()
+        ui.link('1. Sign in with Tesla', login_url, new_tab=True).classes('text-blue-500 text-lg')
+        ui.label('2. After signing in, you\'ll see a blank page. Copy the "code" value from the URL and paste it below.').classes('text-sm')
+        code_input = ui.input('Authorization code').classes('w-full')
+
+        async def on_submit():
+            try:
+                await mgr.complete_auth(code_input.value.strip())
+                ui.navigate.to('/')
+            except Exception as e:
+                mgr._log(f'Auth failed: {e}')
+                ui.notify(f'Auth failed: {e}', type='negative')
+
+        ui.button('Connect', on_click=on_submit).classes('bg-blue-600')
+
+
+# ---------------------------------------------------------------------------
 # NiceGUI Dashboard
 # ---------------------------------------------------------------------------
+MODE_DESCRIPTIONS = {
+    'Not Authenticated': 'Sign in to connect your Tesla account',
+    'Manual Override': f'Charging to {WEEKEND_LIMIT}% — will reset to {IDLE_LIMIT}% when full',
+    'Top-Off Guard': f'Charges to {WEEKDAY_LIMIT}% only if battery drops below {CHARGE_TRIGGER}%, then idles at {IDLE_LIMIT}%',
+    'Overnight Charge': f'Will charge to {WEEKEND_LIMIT}% for LFP calibration, then idle at {IDLE_LIMIT}% (skips if above {OVERNIGHT_SKIP}%)',
+    'Weekend Guard': f'Charges to {WEEKDAY_LIMIT}% only if battery drops below {CHARGE_TRIGGER}%, then idles at {IDLE_LIMIT}%',
+    'Idle': 'No active rule — monitoring',
+}
+
+
 def build_ui(mgr: TeslaManager):
 
-    with ui.column().classes('w-full max-w-2xl mx-auto p-4 gap-4'):
-        ui.label('Tesla Smart-Charge Manager').classes('text-2xl font-bold')
+    with ui.column().classes('w-full max-w-3xl mx-auto p-4 sm:p-6 gap-4 sm:gap-6'):
+        # --- Header ---
+        with ui.card().classes('w-full bg-gradient-to-r from-blue-600 to-blue-700'):
+            ui.label('Tesla Smart-Charge Manager').classes('text-2xl sm:text-3xl font-bold text-white')
+            ui.label('LFP Battery Health Optimizer').classes('text-xs sm:text-sm text-blue-100')
 
         # --- Status Cards ---
-        with ui.row().classes('w-full gap-4'):
-            with ui.card().classes('flex-1'):
-                ui.label('Battery').classes('text-sm text-gray-500')
-                battery_label = ui.label('--').classes('text-3xl font-bold')
+        with ui.row().classes('w-full gap-2 sm:gap-4 items-stretch'):
+            with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
+                ui.label('Battery').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
+                battery_label = ui.label('--').classes('text-3xl sm:text-4xl font-bold text-blue-600')
 
-            with ui.card().classes('flex-1'):
-                ui.label('Charge State').classes('text-sm text-gray-500')
-                state_label = ui.label('--').classes('text-xl')
+            with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
+                ui.label('State').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
+                state_label = ui.label('--').classes('text-sm sm:text-lg font-medium')
 
-            with ui.card().classes('flex-1'):
-                ui.label('Charge Limit').classes('text-sm text-gray-500')
-                limit_label = ui.label('--').classes('text-xl')
+            with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
+                ui.label('Limit').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
+                limit_label = ui.label('--').classes('text-sm sm:text-lg font-medium')
 
-        with ui.card().classes('w-full'):
-            ui.label('Active Mode').classes('text-sm text-gray-500')
-            mode_label = ui.label('--').classes('text-xl font-semibold')
-            error_label = ui.label('').classes('text-red-500 text-sm')
+        with ui.card().classes('w-full p-3 sm:p-4'):
+            ui.label('Active Mode').classes('text-xs uppercase tracking-wide text-gray-500 mb-2')
+            mode_label = ui.label('--').classes('text-xl sm:text-2xl font-bold text-gray-800 mb-1')
+            mode_desc_label = ui.label('').classes('text-xs sm:text-sm text-gray-600')
+            error_label = ui.label('').classes('text-red-600 text-xs sm:text-sm font-medium mt-2')
 
-        # --- Action Buttons ---
-        with ui.row().classes('w-full gap-2'):
-            def on_refresh():
-                try:
-                    mgr.refresh_state()
-                    mgr._log('Manual refresh — data updated')
-                except Exception as e:
-                    mgr._log(f'Refresh failed: {e}')
+        # --- Refresh Button ---
+        async def on_refresh():
+            try:
+                await mgr.refresh_state()
+                mgr._log('Manual refresh — data updated')
+            except Exception as e:
+                mgr._log(f'Refresh failed: {e}')
 
-            ui.button('Refresh State', on_click=on_refresh).classes('bg-gray-600')
+        ui.button('Refresh State', on_click=on_refresh, icon='refresh').classes('w-full bg-gray-700 hover:bg-gray-800')
 
-            def on_override():
+        # --- Charge to 100% / Schedule Section ---
+        with ui.card().classes('w-full p-3 sm:p-4'):
+            ui.label('Charge to 100%').classes('text-base sm:text-lg font-semibold mb-3')
+
+            async def on_override():
                 try:
                     mgr.manual_override = True
-                    mgr.refresh_state()
-                    mgr.set_charge_limit(WEEKEND_LIMIT)
-                    mgr.start_charging()
+                    await mgr.refresh_state()
+                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                    await mgr.start_charging()
                     mgr._log('Manual override — charging to 100%')
                 except Exception as e:
                     mgr._log(f'Override failed: {e}')
 
-            def on_cancel_override():
+            async def on_cancel_override():
                 try:
                     mgr.manual_override = False
-                    mgr.set_charge_limit(WEEKDAY_LIMIT)
-                    mgr._log('Manual override cancelled, reset to 80%')
+                    await mgr.set_charge_limit(IDLE_LIMIT)
+                    mgr._log(f'Manual override cancelled, limit set to {IDLE_LIMIT}%')
                 except Exception as e:
                     mgr._log(f'Cancel override failed: {e}')
 
-            override_btn = ui.button('Charge to 100% Now', on_click=on_override).classes('bg-blue-600')
-            cancel_btn = ui.button('Cancel Override', on_click=on_cancel_override).classes('bg-red-600')
+            with ui.row().classes('w-full gap-2 sm:gap-3 mb-4'):
+                override_btn = ui.button('Charge Now', on_click=on_override, icon='bolt').classes('flex-1 bg-blue-600 hover:bg-blue-700 text-sm sm:text-base')
+                cancel_btn = ui.button('Cancel Override', on_click=on_cancel_override, icon='close').classes('flex-1 bg-red-600 hover:bg-red-700 text-sm sm:text-base')
 
-        # --- Schedule a Charge ---
-        ui.label('Schedule a 100% Charge').classes('text-lg font-semibold mt-4')
-        with ui.row().classes('w-full gap-2 items-end'):
-            date_input = ui.input('Date', placeholder='YYYY-MM-DD').classes('flex-1')
-            with date_input:
-                with ui.menu() as date_menu:
-                    ui.date(on_change=lambda e: (date_input.set_value(e.value), date_menu.close()))
-                with date_input.add_slot('append'):
-                    ui.icon('edit_calendar').on('click', date_menu.open).classes('cursor-pointer')
+            # --- Schedule ---
+            ui.separator()
+            ui.label('Schedule 100% Charge (done by)').classes('text-sm font-medium text-gray-600 mt-3 mb-2')
+            with ui.row().classes('w-full gap-2 items-end'):
+                date_input = ui.input('Date', placeholder='YYYY-MM-DD').classes('flex-1')
+                with date_input:
+                    with ui.menu() as date_menu:
+                        ui.date(on_change=lambda e: (date_input.set_value(e.value), date_menu.close()))
+                    with date_input.add_slot('append'):
+                        ui.icon('edit_calendar').on('click', date_menu.open).classes('cursor-pointer')
 
-            time_input = ui.input('Time', placeholder='HH:MM', value='20:00').classes('w-28')
+                time_input = ui.input('Time').classes('w-28')
+                with time_input:
+                    with ui.menu() as time_menu:
+                        ui.time(value='20:00', on_change=lambda e: (time_input.set_value(e.value), time_menu.close()))
+                    with time_input.add_slot('append'):
+                        ui.icon('access_time').on('click', time_menu.open).classes('cursor-pointer')
 
-            def on_schedule():
-                try:
-                    dt = datetime.strptime(f'{date_input.value} {time_input.value}', '%Y-%m-%d %H:%M')
-                    if dt <= datetime.now():
-                        mgr._log('Schedule failed — date/time is in the past')
-                        return
-                    mgr.scheduled_charges.append(dt)
-                    mgr.scheduled_charges.sort()
-                    mgr._save_scheduled_charges()
-                    mgr._log(f'Scheduled 100% charge for {dt.strftime("%a %Y-%m-%d %H:%M")}')
-                    date_input.set_value('')
-                except ValueError:
-                    mgr._log('Schedule failed — invalid date or time format')
+                async def on_schedule():
+                    try:
+                        t = time_input.value or '20:00'
+                        dt = datetime.strptime(f'{date_input.value} {t}', '%Y-%m-%d %H:%M')
+                        if dt <= datetime.now():
+                            mgr._log('Schedule failed — date/time is in the past')
+                            return
+                        mgr.scheduled_charges.append(dt)
+                        mgr.scheduled_charges.sort()
+                        mgr._save_scheduled_charges()
+                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %Y-%m-%d %H:%M")}')
+                        date_input.set_value('')
 
-            ui.button('Schedule', on_click=on_schedule).classes('bg-green-600')
+                        # Check if we need to start charging immediately
+                        time_until = (dt - datetime.now()).total_seconds() / 60
+                        if mgr.battery_level is None:
+                            await mgr.refresh_state()
+                        if mgr.battery_level is not None:
+                            # Skip if battery already high enough
+                            if mgr.battery_level >= OVERNIGHT_SKIP:
+                                mgr._log(f'Battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), charge not needed')
+                            else:
+                                percent_needed = 100 - mgr.battery_level
+                                minutes_needed = (percent_needed * 2) + 30
+                                if time_until <= minutes_needed:
+                                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                                    await mgr.start_charging()
+                                    mgr.manual_override = True
+                                    mgr._log(f'Starting now — need {percent_needed}% in {int(time_until)} min')
+                    except ValueError:
+                        mgr._log('Schedule failed — invalid date or time format')
 
-        schedule_container = ui.column().classes('w-full gap-1')
+                ui.button('Schedule', on_click=on_schedule, icon='schedule').classes('bg-green-600 hover:bg-green-700')
+
+            schedule_container = ui.column().classes('w-full gap-2 mt-3')
 
         # --- Behaviour Info ---
-        with ui.expansion('How charging works', icon='info').classes('w-full'):
-            ui.markdown('''
-**Monday — Friday before 8 PM (Daycare Protection)**
-- Battery below 50%: charge limit set to 80%, car charges up to 80%
-- Battery above 50%: charge limit capped to 50%, preventing unwanted charging
+        with ui.expansion('How charging works', icon='info').classes('w-full bg-blue-50 border border-blue-200'):
+            ui.markdown(f'''
+**Default behaviour (Top-Off Guard)**
+- Charge limit kept at {IDLE_LIMIT}% to prevent the car auto-charging when plugged in
+- When battery drops below {CHARGE_TRIGGER}%, limit raised to {WEEKDAY_LIMIT}% for one full session
+- Once charged, limit drops back to {IDLE_LIMIT}%
 
-**Friday at 8:00 PM (Weekly LFP Calibration)**
-- Charge limit set to 100% and charging starts immediately
-- Slow charger has all night to reach full
+**Friday & Saturday at 8 PM (Overnight Charge)**
+- Charges to 100% for weekend use and LFP calibration
+- Once charged, limit resets to {IDLE_LIMIT}% to prevent micro top-offs
+- Only triggers once per night — if you unplug and replug, default behaviour resumes
+- Skipped if battery is already above {OVERNIGHT_SKIP}%
 
-**Saturday — Sunday (Weekend Hold)**
-- Charge limit stays at 100%
-
-**Sunday at 10:00 PM (Smart Reset)**
-- If battery is at 100%, limit resets to 80% ready for Monday
-
-**Manual Override**
-- "Charge to 100% Now" overrides all rules and starts charging
-- Automatically resets to 80% once the battery hits 100%
-
-**Scheduled Charges**
-- One-time 100% charges at a date/time you pick
-- Behaves like a manual override once triggered
+**Charge Now / Scheduled Charges**
+- Charges to 100%, then automatically resets to {IDLE_LIMIT}% when full
 
 **How often does it check?**
-- Every 30 minutes — the car is only woken when an action is needed
+- Every {CHECK_INTERVAL // 60} minutes — the car is only woken when an action is needed
 ''').classes('text-sm')
 
         # --- Action Log ---
-        ui.label('Action Log').classes('text-lg font-semibold mt-4')
-        log_container = ui.column().classes('w-full max-h-96 overflow-y-auto gap-1')
+        with ui.card().classes('w-full p-3 sm:p-4'):
+            ui.label('Action Log').classes('text-base sm:text-lg font-semibold mb-3')
+            log_container = ui.column().classes('w-full max-h-60 sm:max-h-80 overflow-y-auto gap-1 p-2 bg-gray-50 rounded border border-gray-200')
 
         # --- Refresh timer ---
         def refresh_ui():
@@ -358,46 +659,103 @@ def build_ui(mgr: TeslaManager):
             battery_label.text = f'{batt}%' if batt is not None else '--'
             state_label.text = mgr.charge_state
             limit_label.text = f'{mgr.charge_limit}%' if mgr.charge_limit is not None else '--'
-            mode_label.text = mgr.active_mode
+
+            mode = mgr.active_mode
+            mode_label.text = mode
+            mode_desc_label.text = MODE_DESCRIPTIONS.get(mode, '')
             error_label.text = mgr.last_error or ''
 
-            override_btn.visible = not mgr.manual_override
-            cancel_btn.visible = mgr.manual_override
+            override_btn.visible = mgr.authenticated and not mgr.manual_override
+            cancel_btn.visible = mgr.authenticated and mgr.manual_override
 
             schedule_container.clear()
             with schedule_container:
                 if not mgr.scheduled_charges:
-                    ui.label('No scheduled charges').classes('text-sm text-gray-400')
+                    ui.label('No scheduled charges').classes('text-sm text-gray-400 italic')
                 else:
                     for sc in mgr.scheduled_charges:
-                        with ui.row().classes('items-center gap-2'):
-                            ui.label(sc.strftime('%a %Y-%m-%d %H:%M')).classes('text-sm font-mono')
-                            dt_to_remove = sc
-                            ui.button(icon='delete', on_click=lambda _, d=dt_to_remove: (
-                                mgr.scheduled_charges.remove(d),
-                                mgr._save_scheduled_charges(),
-                                mgr._log(f'Removed scheduled charge for {d.strftime("%a %Y-%m-%d %H:%M")}'),
-                            )).props('flat dense size=sm color=red')
+                        with ui.card().classes('w-full p-2'):
+                            with ui.row().classes('items-center gap-3 w-full'):
+                                ui.icon('schedule').classes('text-green-600')
+                                ui.label(sc.strftime('%a %Y-%m-%d %H:%M')).classes('text-sm font-mono flex-1')
+                                dt_to_remove = sc
+                                ui.button(icon='delete', on_click=lambda _, d=dt_to_remove: (
+                                    mgr.scheduled_charges.remove(d),
+                                    mgr._save_scheduled_charges(),
+                                    mgr._log(f'Removed scheduled charge for {d.strftime("%a %Y-%m-%d %H:%M")}'),
+                                )).props('flat dense size=sm').classes('text-red-600')
 
             log_container.clear()
             with log_container:
                 for entry in mgr.action_log[:50]:
-                    ui.label(entry).classes('text-sm font-mono')
+                    ui.label(entry).classes('text-xs font-mono text-gray-700 leading-relaxed')
 
-        ui.timer(30, refresh_ui)
+        timer = ui.timer(30, refresh_ui, active=True)
+        async def on_disconnect():
+            timer.active = False
+        app.on_disconnect(on_disconnect)
         refresh_ui()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-mgr = TeslaManager(TESLA_EMAIL)
+mgr = TeslaManager()
 
 
 @ui.page('/')
-def index():
-    build_ui(mgr)
+async def index():
+    # Add PWA meta tags
+    ui.add_head_html('''
+        <link rel="manifest" href="/manifest.json">
+        <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+        <meta name="theme-color" content="#3B82F6">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="default">
+        <meta name="apple-mobile-web-app-title" content="Tesla Charge">
+        <link rel="apple-touch-icon" href="/static/favicon.svg">
+    ''')
+
+    # Wait for init_api() to finish before deciding which UI to show
+    while not mgr.init_done:
+        await asyncio.sleep(0.2)
+    if not mgr.authenticated:
+        # Redirect directly to Tesla OAuth
+        ui.navigate.to(mgr.get_login_url(), new_tab=False)
+    else:
+        build_ui(mgr)
 
 
-app.on_startup(lambda: asyncio.create_task(charge_loop(mgr)))
-ui.run(port=8080, host='0.0.0.0', title='Tesla Smart-Charge', reload=False)
+@ui.page('/auth/callback')
+async def auth_callback(code: str = ''):
+    """Handle OAuth callback from Tesla"""
+    if code:
+        try:
+            await mgr.complete_auth(code)
+            ui.navigate.to('/')
+        except Exception as e:
+            mgr._log(f'Auth callback failed: {e}')
+            ui.label(f'Authentication failed: {e}').classes('text-red-600')
+    else:
+        ui.label('No authorization code received').classes('text-red-600')
+
+
+async def startup():
+    await mgr.init_api()
+    asyncio.create_task(charge_loop(mgr))
+
+
+# Serve static files for favicon and icons
+app.add_static_files('/static', str(Path(__file__).parent / 'static'))
+
+# Add PWA meta tags
+app.add_static_file(local_file=str(Path(__file__).parent / 'static' / 'manifest.json'), url_path='/manifest.json')
+
+app.on_startup(startup)
+ui.run(
+    port=8080,
+    host='0.0.0.0',
+    title='Tesla Smart-Charge',
+    reload=False,
+    favicon='⚡',
+)
