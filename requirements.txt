@@ -1,0 +1,4 @@
+aiohttp
+nicegui
+tesla-fleet-api
+pyzmq

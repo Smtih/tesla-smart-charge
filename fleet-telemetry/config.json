@@ -1,0 +1,24 @@
+{
+  "host": "0.0.0.0",
+  "port": 443,
+  "log_level": "info",
+  "json_log_enable": true,
+  "namespace": "tesla_telemetry",
+  "reliable_ack": false,
+  "transmit_decoded_records": true,
+  "rate_limit": {
+    "enabled": false
+  },
+  "records": {
+    "V": ["zmq"],
+    "alerts": ["logger"],
+    "errors": ["logger"]
+  },
+  "zmq": {
+    "addr": "tcp://*:5284"
+  },
+  "tls": {
+    "server_cert": "/certs/fullchain.pem",
+    "server_key": "/certs/privkey.pem"
+  }
+}
