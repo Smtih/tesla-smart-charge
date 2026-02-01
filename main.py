@@ -71,7 +71,7 @@ def _load_env_var(name: str) -> str:
     return ''
 
 DUCKDNS_TOKEN = _load_env_var('DUCKDNS_TOKEN')
-TESLA_REDIRECT_URI = os.environ.get('TESLA_REDIRECT_URI', 'https://smtihtesla.duckdns.org:8080/auth/callback')
+TESLA_REDIRECT_URI = os.environ.get('TESLA_REDIRECT_URI', 'https://auth.tesla.com/void/callback')
 PRIVATE_KEY_PATH = str(Path(__file__).parent / 'private-key.pem')
 TOKEN_FILE = Path(__file__).parent / 'token.json'
 
@@ -595,6 +595,9 @@ def build_auth_ui(mgr: TeslaManager):
         async def on_submit():
             try:
                 await mgr.complete_auth(code_input.value.strip())
+                # Set browser session (30 days)
+                app.storage.user['email'] = TESLA_EMAIL
+                app.storage.user['session_expires'] = int(time.time()) + 30 * 24 * 3600
                 ui.navigate.to('/')
             except Exception as e:
                 mgr._log(f'Auth failed: {e}')
@@ -833,11 +836,15 @@ async def index():
         else:
             # Session valid but server lost tokens — need re-auth
             app.storage.user.clear()
-            ui.navigate.to(mgr.get_login_url(), new_tab=False)
+            build_auth_ui(mgr)
     else:
-        # No valid session — redirect to Tesla OAuth
+        # No valid session
         app.storage.user.clear()
-        ui.navigate.to(mgr.get_login_url(), new_tab=False)
+        if mgr.authenticated:
+            # Server has tokens but browser has no session — need to re-auth
+            build_auth_ui(mgr)
+        else:
+            build_auth_ui(mgr)
 
 
 @ui.page('/auth/callback')

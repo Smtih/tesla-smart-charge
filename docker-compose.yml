@@ -31,7 +31,7 @@ services:
       - ./smart-charge.log:/app/smart-charge.log
     environment:
       - ZMQ_ENDPOINT=tcp://fleet-telemetry:5284
-      - TESLA_REDIRECT_URI=https://smtihtesla.duckdns.org:8080/auth/callback
+      - TESLA_REDIRECT_URI=https://auth.tesla.com/void/callback
     depends_on:
       - fleet-telemetry
     restart: unless-stopped
