@@ -10,15 +10,22 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
+import zmq
+import zmq.asyncio
 
 from nicegui import app, ui
+import hashlib
 from tesla_fleet_api import TeslaFleetOAuth
 from tesla_fleet_api.const import Scope
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHECK_INTERVAL = 1800  # 30 minutes
+CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
+WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
+ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
+DUCKDNS_DOMAIN = 'smtihtesla'
+DUCKDNS_INTERVAL = 300  # Update DuckDNS every 5 minutes
 WEEKDAY_LIMIT = 75
 WEEKEND_LIMIT = 100
 CHARGE_TRIGGER = 55       # Only start a weekday charge when SOC drops below this
@@ -30,6 +37,7 @@ BATTERY_CAPACITY_KWH = 60
 CHARGER_POWER_KW = 2.3    # 10A × 230V
 CHARGE_EFFICIENCY = 0.90   # ~10% AC conversion / heat losses
 CHARGE_BUFFER_MIN = 30     # Extra time for cell balancing at top end
+
 
 def _estimate_charge_minutes(percent_needed: float) -> float:
     """Estimate minutes to charge `percent_needed`% on a 10A wall charger."""
@@ -50,7 +58,20 @@ def _load_client_secret() -> str:
     return ''
 
 TESLA_CLIENT_SECRET = _load_client_secret()
-TESLA_REDIRECT_URI = 'http://localhost:8080/auth/callback'
+
+def _load_env_var(name: str) -> str:
+    val = os.environ.get(name, '')
+    if val:
+        return val
+    env_file = Path(__file__).parent / '.env'
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith(f'{name}='):
+                return line.split('=', 1)[1].strip()
+    return ''
+
+DUCKDNS_TOKEN = _load_env_var('DUCKDNS_TOKEN')
+TESLA_REDIRECT_URI = os.environ.get('TESLA_REDIRECT_URI', 'https://smtihtesla.duckdns.org:8080/auth/callback')
 PRIVATE_KEY_PATH = str(Path(__file__).parent / 'private-key.pem')
 TOKEN_FILE = Path(__file__).parent / 'token.json'
 
@@ -102,6 +123,7 @@ class TeslaManager:
         self.battery_level: int | None = None
         self.charge_state: str = 'Unknown'
         self.charge_limit: int | None = None
+        self.last_telemetry_update: datetime | None = None
         self.manual_override: bool = False
         self.action_log: list[str] = []
         self.last_error: str | None = None
@@ -228,6 +250,18 @@ class TeslaManager:
             self.oauth._access_token = data['access_token']
             self.oauth.expires = int(time.time()) + data['expires_in']
 
+            # Verify the authenticated user is the owner
+            async with self.session.get(
+                'https://fleet-api.prd.na.vn.cloud.tesla.com/api/1/users/me',
+                headers={'Authorization': f'Bearer {self.oauth._access_token}'},
+            ) as me_resp:
+                me_data = await me_resp.json()
+                user_email = me_data.get('response', {}).get('email', '')
+                if user_email.lower() != TESLA_EMAIL.lower():
+                    self.oauth._access_token = None
+                    self.oauth.refresh_token = None
+                    raise RuntimeError(f'Access denied — account {user_email} is not authorized')
+
         save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
         await self._setup_vehicle()
         self.authenticated = True
@@ -333,6 +367,63 @@ class TeslaManager:
             return 'Top-Off Guard - Charging'
         return 'Top-Off Guard'
 
+    def update_from_telemetry(self, fields: dict):
+        """Apply streamed telemetry fields to local state."""
+        changed = False
+        if 'Soc' in fields:
+            new_level = int(float(fields['Soc']))
+            if new_level != self.battery_level:
+                self.battery_level = new_level
+                changed = True
+        if 'DetailedChargeState' in fields:
+            self.charge_state = fields['DetailedChargeState']
+            changed = True
+        if 'ChargeLimitSoc' in fields:
+            self.charge_limit = int(float(fields['ChargeLimitSoc']))
+            changed = True
+        if 'ChargeAmps' in fields:
+            pass  # Available for future use
+        if changed:
+            self.last_telemetry_update = datetime.now()
+            self._log(f'Telemetry update — battery {self.battery_level}%, state {self.charge_state}, limit {self.charge_limit}%')
+
+
+# ---------------------------------------------------------------------------
+# Telemetry consumer (ZMQ)
+# ---------------------------------------------------------------------------
+async def telemetry_listener(mgr: TeslaManager):
+    """Subscribe to fleet-telemetry ZMQ publisher and update manager state."""
+    ctx = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.connect(ZMQ_ENDPOINT)
+    sock.setsockopt(zmq.SUBSCRIBE, b'')  # Subscribe to all topics
+    mgr._log(f'Telemetry listener connected to {ZMQ_ENDPOINT}')
+
+    try:
+        while True:
+            try:
+                raw = await sock.recv()
+                msg = json.loads(raw)
+                # fleet-telemetry sends: {"data": [{"key": "Soc", "value": {"stringValue": "79"}}, ...], ...}
+                fields = {}
+                for item in msg.get('data', []):
+                    key = item.get('key', '')
+                    value = item.get('value', {})
+                    # Typed values: stringValue, intValue, floatValue, etc.
+                    val = value.get('stringValue') or value.get('intValue') or value.get('floatValue') or value.get('value')
+                    if key and val is not None:
+                        fields[key] = str(val)
+                if fields:
+                    mgr.update_from_telemetry(fields)
+            except json.JSONDecodeError:
+                log.warning(f'Telemetry: invalid JSON received')
+            except zmq.ZMQError as e:
+                mgr._log(f'Telemetry ZMQ error: {e}')
+                await asyncio.sleep(5)
+    finally:
+        sock.close()
+        ctx.term()
+
 
 # ---------------------------------------------------------------------------
 # Background charge loop
@@ -342,16 +433,32 @@ async def charge_loop(mgr: TeslaManager):
     while not mgr.authenticated:
         await asyncio.sleep(5)
 
-    first_run = True
+    # Initial wake + poll to get starting state
+    try:
+        await mgr.refresh_state()
+        mgr._log('Startup — fetched initial state')
+    except Exception as e:
+        mgr._log(f'Startup refresh failed: {e} — will retry next cycle')
+
+    last_wake_poll = datetime.now()
+
     while True:
         try:
-            if first_run:
+            # Fallback: wake + poll if no telemetry received for WAKE_POLL_INTERVAL
+            now_dt = datetime.now()
+            telemetry_stale = (
+                mgr.last_telemetry_update is None
+                or (now_dt - mgr.last_telemetry_update).total_seconds() > WAKE_POLL_INTERVAL
+            )
+            wake_poll_due = (now_dt - last_wake_poll).total_seconds() > WAKE_POLL_INTERVAL
+
+            if telemetry_stale and wake_poll_due:
                 try:
                     await mgr.refresh_state()
-                    mgr._log('Startup — fetched initial state')
+                    last_wake_poll = datetime.now()
+                    mgr._log('Fallback wake poll — no telemetry for 2h, fetched state')
                 except Exception as e:
-                    mgr._log(f'Startup refresh failed: {e} — will retry next cycle')
-                first_run = False
+                    mgr._log(f'Fallback wake poll failed: {e}')
 
             now = datetime.now()
 
@@ -715,11 +822,22 @@ async def index():
     # Wait for init_api() to finish before deciding which UI to show
     while not mgr.init_done:
         await asyncio.sleep(0.2)
-    if not mgr.authenticated:
-        # Redirect directly to Tesla OAuth
-        ui.navigate.to(mgr.get_login_url(), new_tab=False)
+    # Check browser session
+    session_email = app.storage.user.get('email')
+    session_expires = app.storage.user.get('session_expires', 0)
+
+    if session_email == TESLA_EMAIL and time.time() < session_expires:
+        # Valid session — show dashboard if server has tokens
+        if mgr.authenticated:
+            build_ui(mgr)
+        else:
+            # Session valid but server lost tokens — need re-auth
+            app.storage.user.clear()
+            ui.navigate.to(mgr.get_login_url(), new_tab=False)
     else:
-        build_ui(mgr)
+        # No valid session — redirect to Tesla OAuth
+        app.storage.user.clear()
+        ui.navigate.to(mgr.get_login_url(), new_tab=False)
 
 
 @ui.page('/auth/callback')
@@ -728,6 +846,9 @@ async def auth_callback(code: str = ''):
     if code:
         try:
             await mgr.complete_auth(code)
+            # Set browser session (30 days)
+            app.storage.user['email'] = TESLA_EMAIL
+            app.storage.user['session_expires'] = int(time.time()) + 30 * 24 * 3600
             ui.navigate.to('/')
         except Exception as e:
             mgr._log(f'Auth callback failed: {e}')
@@ -736,9 +857,29 @@ async def auth_callback(code: str = ''):
         ui.label('No authorization code received').classes('text-red-600')
 
 
+async def duckdns_updater():
+    """Update DuckDNS with current public IP every 5 minutes."""
+    if not DUCKDNS_TOKEN:
+        log.warning('DUCKDNS_TOKEN not set — skipping DuckDNS updates')
+        return
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                url = f'https://www.duckdns.org/update?domains={DUCKDNS_DOMAIN}&token={DUCKDNS_TOKEN}&ip='
+                async with session.get(url) as resp:
+                    result = await resp.text()
+                    if result.strip() != 'OK':
+                        log.warning(f'DuckDNS update failed: {result}')
+            except Exception as e:
+                log.warning(f'DuckDNS update error: {e}')
+            await asyncio.sleep(DUCKDNS_INTERVAL)
+
+
 async def startup():
     await mgr.init_api()
     asyncio.create_task(charge_loop(mgr))
+    asyncio.create_task(telemetry_listener(mgr))
+    asyncio.create_task(duckdns_updater())
 
 
 # Serve static files for favicon and icons
@@ -754,4 +895,5 @@ ui.run(
     title='Tesla Smart-Charge',
     reload=False,
     favicon='⚡',
+    storage_secret=hashlib.sha256(TESLA_CLIENT_SECRET.encode()).hexdigest(),
 )

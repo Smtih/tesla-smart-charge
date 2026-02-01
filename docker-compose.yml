@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  fleet-telemetry:
+    image: tesla/fleet-telemetry:latest
+    ports:
+      - "443:443"
+    volumes:
+      - ./fleet-telemetry/config.json:/etc/fleet-telemetry/config.json:ro
+      - ./certs:/certs:ro
+    restart: unless-stopped
+
+  public-key-server:
+    image: nginx:alpine
+    ports:
+      - "8443:443"
+    volumes:
+      - ./public-key.pem:/usr/share/nginx/html/.well-known/appspecific/com.tesla.3p.public-key.pem:ro
+      - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  app:
+    build: .
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./private-key.pem:/app/private-key.pem:ro
+      - ./token.json:/app/token.json
+      - ./scheduled_charges.json:/app/scheduled_charges.json
+      - ./smart-charge.log:/app/smart-charge.log
+    environment:
+      - ZMQ_ENDPOINT=tcp://fleet-telemetry:5284
+      - TESLA_REDIRECT_URI=https://smtihtesla.duckdns.org:8080/auth/callback
+    depends_on:
+      - fleet-telemetry
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:443"
+    volumes:
+      - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
+      - ./nginx-app.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
