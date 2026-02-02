@@ -21,7 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-APP_VERSION = '2026.02.02e'
+APP_VERSION = '2026.02.02f'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -253,6 +253,21 @@ class TeslaManager:
             self.oauth.refresh_token = data.get('refresh_token')
             self.oauth._access_token = data['access_token']
             self.oauth.expires = int(time.time()) + data['expires_in']
+
+            # Verify identity via id_token (JWT) — no extra API call needed
+            id_token = data.get('id_token', '')
+            if id_token and TESLA_EMAIL:
+                import base64
+                # JWT is header.payload.signature — decode payload
+                payload_b64 = id_token.split('.')[1]
+                # Add padding
+                payload_b64 += '=' * (4 - len(payload_b64) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+                token_email = claims.get('email', '')
+                if token_email.lower() != TESLA_EMAIL.lower():
+                    self.oauth._access_token = None
+                    self.oauth.refresh_token = None
+                    raise RuntimeError(f'Access denied — account {token_email} is not authorized')
 
         save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
         await self._setup_vehicle()
