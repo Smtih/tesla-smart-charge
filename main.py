@@ -446,7 +446,9 @@ async def telemetry_listener(mgr: TeslaManager):
     try:
         while True:
             try:
-                raw = await sock.recv()
+                parts = await sock.recv_multipart()
+                # Frame 0: topic (e.g. "tesla_telemetry_V"), Frame 1: JSON payload
+                raw = parts[1] if len(parts) > 1 else parts[0]
                 msg = json.loads(raw)
                 # fleet-telemetry sends: {"data": [{"key": "Soc", "value": {"stringValue": "79"}}, ...], ...}
                 fields = {}
