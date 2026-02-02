@@ -595,24 +595,7 @@ def build_auth_ui(mgr: TeslaManager):
         ui.label('Sign in to connect your Tesla').classes('text-gray-500')
 
         login_url = mgr.get_login_url()
-        ui.link('1. Sign in with Tesla', login_url, new_tab=True).classes('text-blue-500 text-lg')
-        ui.label('2. After signing in, you\'ll see a blank page. Copy the "code" value from the URL and paste it below.').classes('text-sm')
-        code_input = ui.input('Authorization code').classes('w-full')
-
-        async def on_submit():
-            try:
-                await mgr.complete_auth(code_input.value.strip())
-                # Set browser session (30 days)
-                app.storage.user['email'] = TESLA_EMAIL
-                app.storage.user['session_expires'] = int(time.time()) + 30 * 24 * 3600
-                ui.navigate.to('/')
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                mgr._log(f'Auth failed: {e}\n{tb}')
-                ui.notify(f'Auth failed: {e}', type='negative')
-
-        ui.button('Connect', on_click=on_submit).classes('bg-blue-600')
+        ui.link('Sign in with Tesla', login_url).classes('text-blue-500 text-lg')
     ui.label(f'v{APP_VERSION}').classes('text-xs text-gray-400 mt-4')
 
 

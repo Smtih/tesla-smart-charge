@@ -10,7 +10,7 @@ services:
       - ./certs:/certs:ro
     restart: unless-stopped
 
-  public-key-server:
+  nginx:
     image: nginx:alpine
     ports:
       - "443:443"
@@ -19,6 +19,8 @@ services:
       - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
       - ./certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
     restart: unless-stopped
 
   vehicle-command-proxy:
@@ -48,19 +50,8 @@ services:
       - ./smart-charge.log:/app/smart-charge.log
     environment:
       - ZMQ_ENDPOINT=tcp://fleet-telemetry:5284
-      - TESLA_REDIRECT_URI=https://auth.tesla.com/void/callback
+      - TESLA_REDIRECT_URI=https://smtih.duckdns.org/auth/callback
     depends_on:
       - fleet-telemetry
     restart: unless-stopped
 
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "8080:443"
-    volumes:
-      - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
-      - ./certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
-      - ./nginx-app.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - app
-    restart: unless-stopped
