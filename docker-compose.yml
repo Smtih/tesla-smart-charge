@@ -4,7 +4,7 @@ services:
   fleet-telemetry:
     image: tesla/fleet-telemetry:latest
     ports:
-      - "443:443"
+      - "4443:4443"
     volumes:
       - ./fleet-telemetry/config.json:/etc/fleet-telemetry/config.json:ro
       - ./certs:/certs:ro
@@ -13,7 +13,7 @@ services:
   public-key-server:
     image: nginx:alpine
     ports:
-      - "8443:443"
+      - "443:443"
     volumes:
       - ./public-key.pem:/usr/share/nginx/html/.well-known/appspecific/com.tesla.3p.public-key.pem:ro
       - ./certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
