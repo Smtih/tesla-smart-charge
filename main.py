@@ -21,7 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-APP_VERSION = '2026.02.02g'
+APP_VERSION = '2026.02.02h'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -46,6 +46,7 @@ def _estimate_charge_minutes(percent_needed: float) -> float:
     effective_kw = CHARGER_POWER_KW * CHARGE_EFFICIENCY
     return (kwh_needed / effective_kw) * 60 + CHARGE_BUFFER_MIN
 TESLA_EMAIL = 'smith.w.da@gmail.com'
+TESLA_OWNER_SUB = os.environ.get('TESLA_OWNER_SUB', '5bf3bacf-25b4-49de-90c6-99ff813f121b')
 TESLA_CLIENT_ID = '46b3b38b-c7c1-4015-9f6d-51bcaf2729b3'
 def _load_client_secret() -> str:
     val = os.environ.get('TESLA_CLIENT_SECRET', '')
@@ -261,15 +262,12 @@ class TeslaManager:
                 payload_b64 = id_token.split('.')[1]
                 payload_b64 += '=' * (4 - len(payload_b64) % 4)
                 claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-                log.info(f'id_token claims: {list(claims.keys())}')
-                # Tesla uses 'sub' as unique user ID; email may not be present
-                token_email = claims.get('email', '')
                 token_sub = claims.get('sub', '')
-                if TESLA_EMAIL and token_email and token_email.lower() != TESLA_EMAIL.lower():
+                if TESLA_OWNER_SUB and token_sub != TESLA_OWNER_SUB:
                     self.oauth._access_token = None
                     self.oauth.refresh_token = None
-                    raise RuntimeError(f'Access denied — account {token_email} is not authorized')
-                self._log(f'Authenticated as sub={token_sub} email={token_email}')
+                    raise RuntimeError(f'Access denied — account {token_sub} is not authorized')
+                self._log(f'Authenticated as sub={token_sub}')
 
         save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
         await self._setup_vehicle()
