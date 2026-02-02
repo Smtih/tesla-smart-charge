@@ -21,7 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-APP_VERSION = '2026.02.02c'
+APP_VERSION = '2026.02.02d'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -262,11 +262,13 @@ class TeslaManager:
                 me_data = await me_resp.json(content_type=None)
                 if not isinstance(me_data, dict):
                     raise RuntimeError(f'/users/me returned non-JSON (HTTP {me_resp.status})')
-                user_email = me_data.get('response', {}).get('email', '')
+                log.info(f'/users/me response: {me_data}')
+                response = me_data.get('response') or {}
+                user_email = response.get('email', '')
                 if user_email.lower() != TESLA_EMAIL.lower():
                     self.oauth._access_token = None
                     self.oauth.refresh_token = None
-                    raise RuntimeError(f'Access denied — account {user_email} is not authorized')
+                    raise RuntimeError(f'Access denied — account {user_email} is not authorized (response: {me_data})')
 
         save_tokens(self.oauth._access_token, self.oauth.refresh_token, self.oauth.expires)
         await self._setup_vehicle()
