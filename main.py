@@ -23,7 +23,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 APP_VERSION = '2026.02.02h'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
-WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
+WAKE_POLL_INTERVAL = 43200     # Fallback: wake + poll every 12 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
 DUCKDNS_DOMAIN = 'smtih'
 DUCKDNS_INTERVAL = 300  # Update DuckDNS every 5 minutes
@@ -125,7 +125,9 @@ class TeslaManager:
         self.battery_level: int | None = None
         self.charge_state: str = 'Unknown'
         self.charge_limit: int | None = None
-        self.last_telemetry_update: datetime | None = None
+        self.battery_level_updated: datetime | None = None
+        self.charge_state_updated: datetime | None = None
+        self.charge_limit_updated: datetime | None = None
         self.manual_override: bool = False
         self.action_log: list[str] = []
         self.last_error: str | None = None
@@ -334,9 +336,13 @@ class TeslaManager:
                     raise
                 await asyncio.sleep(5)
         cs = data['response']['charge_state']
+        now = datetime.now()
         self.battery_level = cs['battery_level']
+        self.battery_level_updated = now
         self.charge_state = cs['charging_state']
+        self.charge_state_updated = now
         self.charge_limit = cs['charge_limit_soc']
+        self.charge_limit_updated = now
         self.last_error = None
 
     async def set_charge_limit(self, pct: int):
@@ -376,22 +382,23 @@ class TeslaManager:
 
     def update_from_telemetry(self, fields: dict):
         """Apply streamed telemetry fields to local state."""
+        now = datetime.now()
         changed = False
         if 'Soc' in fields:
             new_level = int(float(fields['Soc']))
             if new_level != self.battery_level:
                 self.battery_level = new_level
                 changed = True
+            self.battery_level_updated = now
         if 'DetailedChargeState' in fields:
             self.charge_state = fields['DetailedChargeState']
+            self.charge_state_updated = now
             changed = True
         if 'ChargeLimitSoc' in fields:
             self.charge_limit = int(float(fields['ChargeLimitSoc']))
+            self.charge_limit_updated = now
             changed = True
-        if 'ChargeAmps' in fields:
-            pass  # Available for future use
         if changed:
-            self.last_telemetry_update = datetime.now()
             self._log(f'Telemetry update — battery {self.battery_level}%, state {self.charge_state}, limit {self.charge_limit}%')
 
 
@@ -440,30 +447,18 @@ async def charge_loop(mgr: TeslaManager):
     while not mgr.authenticated:
         await asyncio.sleep(5)
 
-    # Initial wake + poll to get starting state
-    try:
-        await mgr.refresh_state()
-        mgr._log('Startup — fetched initial state')
-    except Exception as e:
-        mgr._log(f'Startup refresh failed: {e} — will retry next cycle')
-
-    last_wake_poll = datetime.now()
+    mgr._log('Charge loop started — waiting for telemetry')
 
     while True:
         try:
-            # Fallback: wake + poll if no telemetry received for WAKE_POLL_INTERVAL
+            # Fallback: wake + poll if oldest field timestamp exceeds 12h (or no data at all)
             now_dt = datetime.now()
-            telemetry_stale = (
-                mgr.last_telemetry_update is None
-                or (now_dt - mgr.last_telemetry_update).total_seconds() > WAKE_POLL_INTERVAL
-            )
-            wake_poll_due = (now_dt - last_wake_poll).total_seconds() > WAKE_POLL_INTERVAL
-
-            if telemetry_stale and wake_poll_due:
+            field_timestamps = [t for t in (mgr.battery_level_updated, mgr.charge_state_updated, mgr.charge_limit_updated) if t is not None]
+            oldest = min(field_timestamps) if field_timestamps else None
+            if oldest is None or (now_dt - oldest).total_seconds() > WAKE_POLL_INTERVAL:
                 try:
                     await mgr.refresh_state()
-                    last_wake_poll = datetime.now()
-                    mgr._log('Fallback wake poll — no telemetry for 2h, fetched state')
+                    mgr._log('Fallback wake poll — telemetry stale for 12h, fetched state')
                 except Exception as e:
                     mgr._log(f'Fallback wake poll failed: {e}')
 
@@ -498,10 +493,6 @@ async def charge_loop(mgr: TeslaManager):
                     mgr.scheduled_charges.pop(0)
                     mgr._save_scheduled_charges()
                 else:
-                    # Get current battery level
-                    if mgr.battery_level is None:
-                        await mgr.refresh_state()
-
                     if mgr.battery_level is not None:
                         # Skip if battery already high enough AND close to scheduled time
                         if mgr.battery_level >= OVERNIGHT_SKIP and time_until <= 30:
@@ -523,7 +514,6 @@ async def charge_loop(mgr: TeslaManager):
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
-                await mgr.refresh_state()
                 if mgr.battery_level is not None and mgr.battery_level >= 100:
                     # Check if this was a scheduled charge
                     if mgr.active_scheduled_charge:
@@ -567,13 +557,12 @@ async def charge_loop(mgr: TeslaManager):
                         mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, all good')
                 elif mgr.battery_level < CHARGE_TRIGGER:
                     if mgr.charge_limit != WEEKDAY_LIMIT:
-                        await mgr.refresh_state()
                         await mgr.set_charge_limit(WEEKDAY_LIMIT)
                         mgr._log(f'Top-off guard — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
                     else:
                         mgr._log(f'Top-off guard — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%')
                 else:
-                    mgr._log(f'Top-off guard — battery at {mgr.battery_level}% (hysteresis zone)')
+                    pass  # hysteresis zone — no action needed
 
             else:
                 mgr._log('No matching rule, idle')
@@ -611,6 +600,30 @@ MODE_DESCRIPTIONS = {
 }
 
 
+def _relative_time(dt: datetime | None) -> str:
+    """Format a datetime as a relative time string like '2m ago'."""
+    if dt is None:
+        return 'waiting...'
+    seconds = (datetime.now() - dt).total_seconds()
+    if seconds < 60:
+        return f'{int(seconds)}s ago'
+    minutes = seconds / 60
+    if minutes < 60:
+        return f'{int(minutes)}m ago'
+    hours = minutes / 60
+    if hours < 24:
+        return f'{int(hours)}h ago'
+    days = hours / 24
+    return f'{int(days)}d ago'
+
+
+def _is_stale(dt: datetime | None) -> bool:
+    """Return True if timestamp is older than 12 hours or None."""
+    if dt is None:
+        return True
+    return (datetime.now() - dt).total_seconds() > WAKE_POLL_INTERVAL
+
+
 def build_ui(mgr: TeslaManager):
 
     with ui.column().classes('w-full max-w-3xl mx-auto p-4 sm:p-6 gap-4 sm:gap-6'):
@@ -624,14 +637,17 @@ def build_ui(mgr: TeslaManager):
             with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
                 ui.label('Battery').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
                 battery_label = ui.label('--').classes('text-3xl sm:text-4xl font-bold text-blue-600')
+                battery_age_label = ui.label('waiting...').classes('text-xs text-gray-400 mt-1')
 
             with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
                 ui.label('State').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
                 state_label = ui.label('--').classes('text-sm sm:text-lg font-medium')
+                state_age_label = ui.label('waiting...').classes('text-xs text-gray-400 mt-1')
 
             with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
                 ui.label('Limit').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
                 limit_label = ui.label('--').classes('text-sm sm:text-lg font-medium')
+                limit_age_label = ui.label('waiting...').classes('text-xs text-gray-400 mt-1')
 
         with ui.card().classes('w-full p-3 sm:p-4'):
             ui.label('Active Mode').classes('text-xs uppercase tracking-wide text-gray-500 mb-2')
@@ -656,7 +672,6 @@ def build_ui(mgr: TeslaManager):
             async def on_override():
                 try:
                     mgr.manual_override = True
-                    await mgr.refresh_state()
                     await mgr.set_charge_limit(WEEKEND_LIMIT)
                     await mgr.start_charging()
                     mgr._log('Manual override — charging to 100%')
@@ -720,8 +735,6 @@ def build_ui(mgr: TeslaManager):
 
                         # Check if we need to start charging immediately
                         time_until = (dt - datetime.now()).total_seconds() / 60
-                        if mgr.battery_level is None:
-                            await mgr.refresh_state()
                         if mgr.battery_level is not None:
                             # Skip if battery already high enough
                             if mgr.battery_level >= OVERNIGHT_SKIP:
@@ -753,6 +766,16 @@ def build_ui(mgr: TeslaManager):
             battery_label.text = f'{batt}%' if batt is not None else '--'
             state_label.text = mgr.charge_state
             limit_label.text = f'{mgr.charge_limit}%' if mgr.charge_limit is not None else '--'
+
+            # Update per-field age labels
+            battery_age_label.text = _relative_time(mgr.battery_level_updated)
+            state_age_label.text = _relative_time(mgr.charge_state_updated)
+            limit_age_label.text = _relative_time(mgr.charge_limit_updated)
+            for lbl, ts in [(battery_age_label, mgr.battery_level_updated), (state_age_label, mgr.charge_state_updated), (limit_age_label, mgr.charge_limit_updated)]:
+                if _is_stale(ts):
+                    lbl.classes(remove='text-gray-400', add='text-orange-500')
+                else:
+                    lbl.classes(remove='text-orange-500', add='text-gray-400')
 
             mode = mgr.active_mode
             mode_label.text = mode
