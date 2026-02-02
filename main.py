@@ -229,8 +229,8 @@ class TeslaManager:
         if not TESLA_CLIENT_SECRET:
             raise RuntimeError('TESLA_CLIENT_SECRET env var is not set')
 
-        # Exchange code for tokens — use a separate request to avoid JSON content-type
-        async with aiohttp.ClientSession().post(
+        # Exchange code for tokens
+        async with self.session.post(
             'https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token',
             data={
                 'grant_type': 'authorization_code',
@@ -240,7 +240,10 @@ class TeslaManager:
                 'redirect_uri': TESLA_REDIRECT_URI,
             },
         ) as resp:
-            data = await resp.json()
+            data = await resp.json(content_type=None)
+            if not isinstance(data, dict):
+                body = await resp.text()
+                raise RuntimeError(f'Token exchange returned non-JSON response (HTTP {resp.status}): {body[:300]}')
             log.info(f'Token response keys: {list(data.keys())}')
             if not resp.ok:
                 raise RuntimeError(f'Token exchange failed: {data}')
