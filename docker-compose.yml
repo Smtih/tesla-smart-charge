@@ -47,6 +47,7 @@ services:
       - ./private-key.pem:/app/private-key.pem:ro
       - ./token.json:/app/token.json
       - ./scheduled_charges.json:/app/scheduled_charges.json
+      - ./vehicle_state.json:/app/vehicle_state.json
       - ./smart-charge.log:/app/smart-charge.log
     environment:
       - ZMQ_ENDPOINT=tcp://fleet-telemetry:5284

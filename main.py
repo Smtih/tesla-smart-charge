@@ -76,6 +76,7 @@ DUCKDNS_TOKEN = _load_env_var('DUCKDNS_TOKEN')
 TESLA_REDIRECT_URI = os.environ.get('TESLA_REDIRECT_URI', 'https://auth.tesla.com/void/callback')
 PRIVATE_KEY_PATH = str(Path(__file__).parent / 'private-key.pem')
 TOKEN_FILE = Path(__file__).parent / 'token.json'
+STATE_FILE = Path(__file__).parent / 'vehicle_state.json'
 
 LOG_FILE = Path(__file__).parent / 'smart-charge.log'
 logging.basicConfig(
@@ -128,6 +129,7 @@ class TeslaManager:
         self.battery_level_updated: datetime | None = None
         self.charge_state_updated: datetime | None = None
         self.charge_limit_updated: datetime | None = None
+        self._load_vehicle_state()
         self.manual_override: bool = False
         self.action_log: list[str] = []
         self.last_error: str | None = None
@@ -183,6 +185,32 @@ class TeslaManager:
     def _save_scheduled_charges(self):
         try:
             self._schedule_file.write_text(json.dumps(self.scheduled_charges))
+        except Exception:
+            pass
+
+    def _load_vehicle_state(self):
+        try:
+            if STATE_FILE.exists():
+                data = json.loads(STATE_FILE.read_text())
+                self.battery_level = data.get('battery_level')
+                self.charge_state = data.get('charge_state', 'Unknown')
+                self.charge_limit = data.get('charge_limit')
+                for field in ('battery_level_updated', 'charge_state_updated', 'charge_limit_updated'):
+                    val = data.get(field)
+                    setattr(self, field, datetime.fromisoformat(val) if val else None)
+        except Exception:
+            pass
+
+    def _save_vehicle_state(self):
+        try:
+            STATE_FILE.write_text(json.dumps({
+                'battery_level': self.battery_level,
+                'charge_state': self.charge_state,
+                'charge_limit': self.charge_limit,
+                'battery_level_updated': self.battery_level_updated.isoformat() if self.battery_level_updated else None,
+                'charge_state_updated': self.charge_state_updated.isoformat() if self.charge_state_updated else None,
+                'charge_limit_updated': self.charge_limit_updated.isoformat() if self.charge_limit_updated else None,
+            }))
         except Exception:
             pass
 
@@ -344,6 +372,7 @@ class TeslaManager:
         self.charge_limit = cs['charge_limit_soc']
         self.charge_limit_updated = now
         self.last_error = None
+        self._save_vehicle_state()
 
     async def set_charge_limit(self, pct: int):
         await self._ensure_token()
@@ -399,6 +428,7 @@ class TeslaManager:
             self.charge_limit_updated = now
             changed = True
         if changed:
+            self._save_vehicle_state()
             self._log(f'Telemetry update — battery {self.battery_level}%, state {self.charge_state}, limit {self.charge_limit}%')
 
 
