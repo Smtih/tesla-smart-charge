@@ -21,7 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-APP_VERSION = '2026.02.02b'
+APP_VERSION = '2026.02.02c'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -606,7 +606,9 @@ def build_auth_ui(mgr: TeslaManager):
                 app.storage.user['session_expires'] = int(time.time()) + 30 * 24 * 3600
                 ui.navigate.to('/')
             except Exception as e:
-                mgr._log(f'Auth failed: {e}')
+                import traceback
+                tb = traceback.format_exc()
+                mgr._log(f'Auth failed: {e}\n{tb}')
                 ui.notify(f'Auth failed: {e}', type='negative')
 
         ui.button('Connect', on_click=on_submit).classes('bg-blue-600')
