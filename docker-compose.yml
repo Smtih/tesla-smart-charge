@@ -21,6 +21,23 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
+  vehicle-command-proxy:
+    image: tesla/vehicle-command:latest
+    ports:
+      - "4430:443"
+    volumes:
+      - ./private-key.pem:/data/private-key.pem:ro
+      - ./certs/fullchain.pem:/data/tls-cert.pem:ro
+      - ./certs/privkey.pem:/data/tls-key.pem:ro
+    environment:
+      - TESLA_KEY_FILE=/data/private-key.pem
+      - TESLA_HTTP_PROXY_TLS_CERT=/data/tls-cert.pem
+      - TESLA_HTTP_PROXY_TLS_KEY=/data/tls-key.pem
+      - TESLA_HTTP_PROXY_HOST=0.0.0.0
+      - TESLA_HTTP_PROXY_PORT=443
+      - TESLA_HTTP_PROXY_TIMEOUT=10s
+    restart: unless-stopped
+
   app:
     build: .
     volumes:
