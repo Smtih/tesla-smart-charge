@@ -22,13 +22,14 @@ def _make_key_pem(bits=2048):
     )
 
 # ---- Config ----
-DOMAIN = 'smtihtesla'
+DOMAIN = 'smtih'
 FQDN = f'{DOMAIN}.duckdns.org'
-CERTS_DIR = Path(__file__).parent / 'certs'
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+CERTS_DIR = PROJECT_DIR / 'certs'
 ACME_DIR = 'https://acme-v02.api.letsencrypt.org/directory'
 EMAIL = 'smith.w.da@gmail.com'
 
-env_file = Path(__file__).parent / '.env'
+env_file = PROJECT_DIR / '.env'
 DUCKDNS_TOKEN = ''
 for line in env_file.read_text().splitlines():
     if line.startswith('DUCKDNS_TOKEN='):
