@@ -21,7 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-APP_VERSION = '2026.02.02a'
+APP_VERSION = '2026.02.02b'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -259,7 +259,9 @@ class TeslaManager:
                 'https://fleet-api.prd.na.vn.cloud.tesla.com/api/1/users/me',
                 headers={'Authorization': f'Bearer {self.oauth._access_token}'},
             ) as me_resp:
-                me_data = await me_resp.json()
+                me_data = await me_resp.json(content_type=None)
+                if not isinstance(me_data, dict):
+                    raise RuntimeError(f'/users/me returned non-JSON (HTTP {me_resp.status})')
                 user_email = me_data.get('response', {}).get('email', '')
                 if user_email.lower() != TESLA_EMAIL.lower():
                     self.oauth._access_token = None
