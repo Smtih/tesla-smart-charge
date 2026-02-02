@@ -216,7 +216,7 @@ class TeslaManager:
         self.init_done = True
 
     def get_login_url(self) -> str:
-        scopes = [Scope.OPENID, Scope.OFFLINE_ACCESS, Scope.VEHICLE_DEVICE_DATA, Scope.VEHICLE_CMDS, Scope.VEHICLE_CHARGING_CMDS]
+        scopes = [Scope.OPENID, Scope.OFFLINE_ACCESS, Scope.VEHICLE_DEVICE_DATA, Scope.VEHICLE_CMDS, Scope.VEHICLE_CHARGING_CMDS, Scope.VEHICLE_LOCATION]
         params = urlencode({
             'response_type': 'code',
             'client_id': TESLA_CLIENT_ID,
