@@ -21,6 +21,7 @@ from tesla_fleet_api.const import Scope
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+APP_VERSION = '2026.02.02a'
 CHECK_INTERVAL = 60            # Check telemetry-driven state every 60 seconds
 WAKE_POLL_INTERVAL = 7200      # Fallback: wake + poll every 2 hours if no telemetry
 ZMQ_ENDPOINT = os.environ.get('ZMQ_ENDPOINT', 'tcp://localhost:5284')
@@ -607,6 +608,7 @@ def build_auth_ui(mgr: TeslaManager):
                 ui.notify(f'Auth failed: {e}', type='negative')
 
         ui.button('Connect', on_click=on_submit).classes('bg-blue-600')
+    ui.label(f'v{APP_VERSION}').classes('text-xs text-gray-400 mt-4')
 
 
 # ---------------------------------------------------------------------------
