@@ -16,7 +16,14 @@ jobs:
           username: ubuntu
           key: ${{ secrets.OCI_SSH_KEY }}
           script: |
+            set -e
             cd ~/tesla-app
+            # Fail if there are local changes that would block pull
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              echo "ERROR: Local changes detected on server. Stash or commit them first."
+              git status
+              exit 1
+            fi
             git pull
             sudo docker compose build app
             sudo docker compose up -d --remove-orphans
