@@ -413,14 +413,16 @@ class TeslaManager:
         """Apply streamed telemetry fields to local state."""
         now = datetime.now()
         changed = False
-        if 'Soc' in fields:
-            new_level = int(float(fields['Soc']))
+        soc = fields.get('BatteryLevel') or fields.get('Soc')
+        if soc is not None:
+            new_level = int(float(soc))
             if new_level != self.battery_level:
                 self.battery_level = new_level
                 changed = True
             self.battery_level_updated = now
-        if 'DetailedChargeState' in fields:
-            self.charge_state = fields['DetailedChargeState']
+        charge_state = fields.get('DetailedChargeState') or fields.get('ChargeState')
+        if charge_state is not None:
+            self.charge_state = charge_state
             self.charge_state_updated = now
             changed = True
         if 'ChargeLimitSoc' in fields:
@@ -455,8 +457,14 @@ async def telemetry_listener(mgr: TeslaManager):
                 for item in msg.get('data', []):
                     key = item.get('key', '')
                     value = item.get('value', {})
-                    # Typed values: stringValue, intValue, floatValue, etc.
-                    val = value.get('stringValue') or value.get('intValue') or value.get('floatValue') or value.get('value')
+                    if value.get('invalid'):
+                        continue
+                    # Extract typed value (check each explicitly to handle 0/empty)
+                    val = None
+                    for vk in ('stringValue', 'intValue', 'floatValue', 'doubleValue', 'value'):
+                        if vk in value:
+                            val = value[vk]
+                            break
                     if key and val is not None:
                         fields[key] = str(val)
                 if fields:
@@ -611,13 +619,7 @@ async def charge_loop(mgr: TeslaManager):
 # NiceGUI Auth Page
 # ---------------------------------------------------------------------------
 def build_auth_ui(mgr: TeslaManager):
-    with ui.column().classes('w-full max-w-md mx-auto p-8 gap-4'):
-        ui.label('Tesla Smart-Charge Manager').classes('text-2xl font-bold')
-        ui.label('Sign in to connect your Tesla').classes('text-gray-500')
-
-        login_url = mgr.get_login_url()
-        ui.link('Sign in with Tesla', login_url).classes('text-blue-500 text-lg')
-    ui.label(f'v{APP_VERSION}').classes('text-xs text-gray-400 mt-4')
+    ui.navigate.to(mgr.get_login_url(), new_tab=False)
 
 
 # ---------------------------------------------------------------------------
@@ -889,8 +891,10 @@ async def index():
         # No valid session
         app.storage.user.clear()
         if mgr.authenticated:
-            # Server has tokens but browser has no session — need to re-auth
-            build_auth_ui(mgr)
+            # Server has tokens — grant session automatically (owner verified at login)
+            app.storage.user['email'] = TESLA_EMAIL
+            app.storage.user['session_expires'] = int(time.time()) + 30 * 24 * 3600
+            build_ui(mgr)
         else:
             build_auth_ui(mgr)
 

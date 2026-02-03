@@ -53,6 +53,7 @@ services:
     environment:
       - ZMQ_ENDPOINT=tcp://fleet-telemetry:5284
       - TESLA_REDIRECT_URI=https://smtih.duckdns.org/auth/callback
+      - TZ=Australia/Melbourne
     depends_on:
       - fleet-telemetry
     restart: unless-stopped
