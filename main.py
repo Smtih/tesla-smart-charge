@@ -769,9 +769,17 @@ def build_ui(mgr: TeslaManager):
                     for sc in mgr.scheduled_charges:
                         with ui.card().classes('w-full p-2'):
                             with ui.row().classes('items-center gap-3 w-full'):
-                                # Icon: repeat if weekly, schedule if one-time
-                                icon_name = 'repeat' if sc.get('repeat_weekly', False) else 'schedule'
-                                icon_color = 'text-blue-600' if sc.get('repeat_weekly', False) else 'text-green-600'
+                                # Icon: bolt if actively charging, repeat if weekly, schedule if one-time
+                                is_active = mgr.active_scheduled_charge == sc
+                                if is_active:
+                                    icon_name = 'bolt'
+                                    icon_color = 'text-yellow-500'
+                                elif sc.get('repeat_weekly', False):
+                                    icon_name = 'repeat'
+                                    icon_color = 'text-blue-600'
+                                else:
+                                    icon_name = 'schedule'
+                                    icon_color = 'text-green-600'
                                 ui.icon(icon_name).classes(icon_color)
 
                                 schedule_time = datetime.fromisoformat(sc["time"])
