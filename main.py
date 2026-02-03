@@ -33,6 +33,42 @@ CHARGE_TRIGGER = 55       # Only start a weekday charge when SOC drops below thi
 NO_CHARGE_ABOVE = 75      # Never trigger a charge if SOC is above this (dead-zone / hysteresis)
 IDLE_LIMIT = 50           # Resting charge limit — prevents car from auto-charging when plugged in
 OVERNIGHT_SKIP = 90       # Skip overnight 100% charge if SOC is already above this
+
+# ---------------------------------------------------------------------------
+# Charge State Mapping (telemetry → consolidated)
+# ---------------------------------------------------------------------------
+# Tesla telemetry sends DetailedChargeState values like:
+#   Disconnected, NoPower, Starting, Charging, Complete, Stopped, Unknown
+# But also non-standard values like: Idle, ClearFaults
+# We consolidate to 3 user-friendly states: Unplugged, Plugged, Charging
+CHARGE_STATE_MAP = {
+    # Unplugged - cable not connected
+    'Disconnected': 'Unplugged',
+    'DetailedChargeStateDisconnected': 'Unplugged',
+
+    # Charging - actively drawing power
+    'Charging': 'Charging',
+    'DetailedChargeStateCharging': 'Charging',
+    'Starting': 'Charging',
+    'DetailedChargeStateStarting': 'Charging',
+
+    # Plugged - connected but not actively charging
+    'Complete': 'Plugged',
+    'DetailedChargeStateComplete': 'Plugged',
+    'Stopped': 'Plugged',
+    'DetailedChargeStateStopped': 'Plugged',
+    'NoPower': 'Plugged',
+    'DetailedChargeStateNoPower': 'Plugged',
+    'Idle': 'Plugged',
+    'ClearFaults': 'Plugged',
+    'Unknown': 'Unknown',
+    'DetailedChargeStateUnknown': 'Unknown',
+}
+
+def normalize_charge_state(raw_state: str) -> str:
+    """Convert raw telemetry/API charge state to consolidated state."""
+    return CHARGE_STATE_MAP.get(raw_state, 'Unknown')
+
 # Charging estimate: LFP Model Y on 10A / 230V wall charger (~2.3 kW)
 BATTERY_CAPACITY_KWH = 60
 CHARGER_POWER_KW = 2.3    # 10A × 230V
@@ -367,7 +403,7 @@ class TeslaManager:
         now = datetime.now()
         self.battery_level = cs['battery_level']
         self.battery_level_updated = now
-        self.charge_state = cs['charging_state']
+        self.charge_state = normalize_charge_state(cs['charging_state'])
         self.charge_state_updated = now
         self.charge_limit = cs['charge_limit_soc']
         self.charge_limit_updated = now
@@ -422,7 +458,7 @@ class TeslaManager:
             self.battery_level_updated = now
         charge_state = fields.get('DetailedChargeState') or fields.get('ChargeState')
         if charge_state is not None:
-            self.charge_state = charge_state
+            self.charge_state = normalize_charge_state(charge_state)
             self.charge_state_updated = now
             changed = True
         if 'ChargeLimitSoc' in fields:
@@ -505,7 +541,7 @@ async def charge_loop(mgr: TeslaManager):
             now = datetime.now()
 
             # --- Reset to idle when unplugged ---
-            if mgr.charge_state == 'Disconnected':
+            if mgr.charge_state == 'Unplugged':
                 # Exit manual override if unplugged
                 if mgr.manual_override:
                     mgr.manual_override = False
@@ -833,7 +869,16 @@ def build_ui(mgr: TeslaManager):
                                 ui.icon(icon_name).classes(icon_color)
 
                                 schedule_time = datetime.fromisoformat(sc["time"])
-                                ui.label(schedule_time.strftime('%a %Y-%m-%d %H:%M')).classes('text-sm font-mono flex-1')
+                                # Calculate projected charge start based on current battery
+                                with ui.column().classes('flex-1 gap-0'):
+                                    ui.label(f'Done by: {schedule_time.strftime("%a %Y-%m-%d %H:%M")}').classes('text-sm font-mono')
+                                    if mgr.battery_level is not None and mgr.battery_level < 100:
+                                        percent_needed = 100 - mgr.battery_level
+                                        minutes_needed = _estimate_charge_minutes(percent_needed)
+                                        start_time = schedule_time - timedelta(minutes=minutes_needed)
+                                        ui.label(f'Start: {start_time.strftime("%a %H:%M")} ({int(minutes_needed)}min to charge {percent_needed}%)').classes('text-xs text-gray-500')
+                                    else:
+                                        ui.label('Battery full or unknown').classes('text-xs text-gray-400')
 
                                 ui.button(icon='delete', on_click=lambda _, s=sc: (
                                     mgr.scheduled_charges.remove(s),
