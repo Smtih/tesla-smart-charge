@@ -469,11 +469,18 @@ class TeslaManager:
             changed = True
         if changed:
             self._save_vehicle_state()
-            # Show raw telemetry state in logs for debugging
-            state_display = self.charge_state
-            if self.charge_state_raw and self.charge_state_raw != self.charge_state:
-                state_display = f'{self.charge_state} (raw: {self.charge_state_raw})'
-            self._log(f'Telemetry — battery {self.battery_level}%, state {state_display}, limit {self.charge_limit}%')
+            # Log exactly what data we received (not inferred values)
+            parts = []
+            if soc is not None:
+                parts.append(f'battery {self.battery_level}%')
+            if raw_charge_state is not None:
+                if raw_charge_state != self.charge_state:
+                    parts.append(f'state {self.charge_state} (raw: {raw_charge_state})')
+                else:
+                    parts.append(f'state {self.charge_state}')
+            if 'ChargeLimitSoc' in fields:
+                parts.append(f'limit {self.charge_limit}%')
+            self._log(f'Telemetry — {", ".join(parts)}')
 
 
 # ---------------------------------------------------------------------------
