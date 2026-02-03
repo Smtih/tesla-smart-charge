@@ -161,6 +161,7 @@ class TeslaManager:
         # State
         self.battery_level: int | None = None
         self.charge_state: str = 'Unknown'
+        self.charge_state_raw: str | None = None  # Raw telemetry value for debugging
         self.charge_limit: int | None = None
         self.battery_level_updated: datetime | None = None
         self.charge_state_updated: datetime | None = None
@@ -458,6 +459,7 @@ class TeslaManager:
             self.battery_level_updated = now
         raw_charge_state = fields.get('DetailedChargeState') or fields.get('ChargeState')
         if raw_charge_state is not None:
+            self.charge_state_raw = raw_charge_state
             self.charge_state = normalize_charge_state(raw_charge_state)
             self.charge_state_updated = now
             changed = True
@@ -469,9 +471,8 @@ class TeslaManager:
             self._save_vehicle_state()
             # Show raw telemetry state in logs for debugging
             state_display = self.charge_state
-            # Always show raw value if state is Unknown or if raw differs from normalized
-            if raw_charge_state and (self.charge_state == 'Unknown' or self.charge_state != raw_charge_state):
-                state_display = f'{self.charge_state} (raw: {raw_charge_state})'
+            if self.charge_state_raw and self.charge_state_raw != self.charge_state:
+                state_display = f'{self.charge_state} (raw: {self.charge_state_raw})'
             self._log(f'Telemetry — battery {self.battery_level}%, state {state_display}, limit {self.charge_limit}%')
 
 
