@@ -177,7 +177,7 @@ class TeslaManager:
     # -- helpers -------------------------------------------------------------
 
     def _log(self, msg: str):
-        ts = datetime.now().strftime('%a %H:%M')
+        ts = datetime.now().strftime('%a %I:%M%p')
         entry = f'[{ts}] {msg}'
         self.action_log.insert(0, entry)
         if len(self.action_log) > 100:
@@ -456,9 +456,9 @@ class TeslaManager:
                 self.battery_level = new_level
                 changed = True
             self.battery_level_updated = now
-        charge_state = fields.get('DetailedChargeState') or fields.get('ChargeState')
-        if charge_state is not None:
-            self.charge_state = normalize_charge_state(charge_state)
+        raw_charge_state = fields.get('DetailedChargeState') or fields.get('ChargeState')
+        if raw_charge_state is not None:
+            self.charge_state = normalize_charge_state(raw_charge_state)
             self.charge_state_updated = now
             changed = True
         if 'ChargeLimitSoc' in fields:
@@ -467,7 +467,11 @@ class TeslaManager:
             changed = True
         if changed:
             self._save_vehicle_state()
-            self._log(f'Telemetry update — battery {self.battery_level}%, state {self.charge_state}, limit {self.charge_limit}%')
+            # Show raw telemetry state in logs for debugging
+            state_display = self.charge_state
+            if raw_charge_state and self.charge_state != raw_charge_state:
+                state_display = f'{self.charge_state} (raw: {raw_charge_state})'
+            self._log(f'Telemetry — battery {self.battery_level}%, state {state_display}, limit {self.charge_limit}%')
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +569,7 @@ async def charge_loop(mgr: TeslaManager):
 
                 # Remove if scheduled time has passed
                 if time_until < 0:
-                    mgr._log(f'Scheduled charge time passed ({next_time.strftime("%a %H:%M")}) — removing from schedule')
+                    mgr._log(f'Scheduled charge time passed ({next_time.strftime("%a %I:%M%p")}) — removing from schedule')
                     mgr.scheduled_charges.pop(0)
                     mgr._save_scheduled_charges()
                 else:
@@ -575,8 +579,7 @@ async def charge_loop(mgr: TeslaManager):
                             mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), skipping')
                             mgr.scheduled_charges.pop(0)
                             mgr._save_scheduled_charges()
-                        elif mgr.battery_level >= OVERNIGHT_SKIP:
-                            mgr._log(f'Scheduled charge — battery at {mgr.battery_level}% (high), monitoring until {next_time.strftime("%H:%M")}')
+                        # No logging while waiting for schedule — only log when taking action
                         else:
                             percent_needed = 100 - mgr.battery_level
                             minutes_needed = _estimate_charge_minutes(percent_needed)
@@ -586,7 +589,7 @@ async def charge_loop(mgr: TeslaManager):
                                 await mgr.start_charging()
                                 mgr.manual_override = True
                                 mgr.active_scheduled_charge = next_schedule
-                                mgr._log(f'Scheduled charge started — need {percent_needed}% (~{int(minutes_needed)} min) in {int(time_until)} min, done by {next_time.strftime("%a %H:%M")}')
+                                mgr._log(f'Scheduled charge started — need {percent_needed}% (~{int(minutes_needed)} min) in {int(time_until)} min, done by {next_time.strftime("%a %I:%M%p")}')
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
@@ -605,7 +608,7 @@ async def charge_loop(mgr: TeslaManager):
                             }
                             mgr.scheduled_charges.append(new_schedule)
                             mgr.scheduled_charges.sort(key=lambda s: s["time"])
-                            mgr._log(f'Repeating schedule — created next instance for {next_time.strftime("%a %H:%M")}')
+                            mgr._log(f'Repeating schedule — created next instance for {next_time.strftime("%a %I:%M%p")}')
 
                         # Remove completed schedule
                         if schedule in mgr.scheduled_charges:
@@ -618,30 +621,19 @@ async def charge_loop(mgr: TeslaManager):
                     await mgr.set_charge_limit(IDLE_LIMIT)
                     mgr.manual_override = False
                     mgr._log(f'Charge complete — battery at 100%, limit set to {IDLE_LIMIT}%')
-                else:
-                    mgr._log(f'Override active — battery at {mgr.battery_level}%')
+                # No logging while override is active — telemetry already logs updates
 
             # --- Rule 2: Top-Off Guard (runs 7 days a week) ---
             elif not mgr.manual_override:
-                if mgr.battery_level is None:
-                    mgr._log('Top-off guard — no battery data, skipping')
-                elif mgr.battery_level >= NO_CHARGE_ABOVE:
+                if mgr.battery_level >= NO_CHARGE_ABOVE:
                     if mgr.charge_limit != IDLE_LIMIT:
                         await mgr.set_charge_limit(IDLE_LIMIT)
                         mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, limit set to {IDLE_LIMIT}%')
-                    else:
-                        mgr._log(f'Top-off guard — battery at {mgr.battery_level}%, all good')
-                elif mgr.battery_level < CHARGE_TRIGGER:
+                elif mgr.battery_level is not None and mgr.battery_level < CHARGE_TRIGGER:
                     if mgr.charge_limit != WEEKDAY_LIMIT:
                         await mgr.set_charge_limit(WEEKDAY_LIMIT)
                         mgr._log(f'Top-off guard — battery {mgr.battery_level}% < {CHARGE_TRIGGER}%, set limit {WEEKDAY_LIMIT}%')
-                    else:
-                        mgr._log(f'Top-off guard — battery {mgr.battery_level}% low, limit already {WEEKDAY_LIMIT}%')
-                else:
-                    pass  # hysteresis zone — no action needed
-
-            else:
-                mgr._log('No matching rule, idle')
+                # No logging for steady-state conditions — only log when taking action
 
         except Exception as e:
             mgr.last_error = str(e)
@@ -668,6 +660,18 @@ MODE_DESCRIPTIONS = {
     'Top-Off Guard': f'Protecting battery from shallow cycles. Charge limit at {IDLE_LIMIT}% until battery drops below {CHARGE_TRIGGER}%.',
     'Top-Off Guard - Charging': f'Battery below {CHARGE_TRIGGER}% — limit raised to {WEEKDAY_LIMIT}% for one full charge session.',
 }
+
+
+def _format_duration(minutes: float) -> str:
+    """Format minutes as 'Xh Ym' or just 'Xm' if under an hour."""
+    minutes = int(minutes)
+    if minutes < 60:
+        return f'{minutes}m'
+    hours = minutes // 60
+    mins = minutes % 60
+    if mins == 0:
+        return f'{hours}h'
+    return f'{hours}h {mins}m'
 
 
 def _relative_time(dt: datetime | None) -> str:
@@ -707,6 +711,7 @@ def build_ui(mgr: TeslaManager):
             with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
                 ui.label('Battery').classes('text-xs uppercase tracking-wide text-gray-500 mb-1')
                 battery_label = ui.label('--').classes('text-3xl sm:text-4xl font-bold text-blue-600')
+                charge_time_label = ui.label('').classes('text-xs text-gray-500')
                 battery_age_label = ui.label('waiting...').classes('text-xs text-gray-400 mt-1')
 
             with ui.card().classes('flex-1 p-3 sm:p-4 flex flex-col'):
@@ -798,7 +803,7 @@ def build_ui(mgr: TeslaManager):
                         mgr._save_scheduled_charges()
 
                         repeat_text = " (repeating weekly)" if repeat_checkbox.value else ""
-                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %Y-%m-%d %H:%M")}{repeat_text}')
+                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %d %b %I:%M%p")}{repeat_text}')
 
                         date_input.set_value('')
                         repeat_checkbox.value = False  # Reset checkbox
@@ -834,6 +839,12 @@ def build_ui(mgr: TeslaManager):
         def refresh_ui():
             batt = mgr.battery_level
             battery_label.text = f'{batt}%' if batt is not None else '--'
+            if batt is not None and batt < 100:
+                percent_needed = 100 - batt
+                minutes_needed = _estimate_charge_minutes(percent_needed)
+                charge_time_label.text = f'{_format_duration(minutes_needed)} to 100%'
+            else:
+                charge_time_label.text = ''
             state_label.text = mgr.charge_state
             limit_label.text = f'{mgr.charge_limit}%' if mgr.charge_limit is not None else '--'
 
@@ -871,19 +882,19 @@ def build_ui(mgr: TeslaManager):
                                 schedule_time = datetime.fromisoformat(sc["time"])
                                 # Calculate projected charge start based on current battery
                                 with ui.column().classes('flex-1 gap-0'):
-                                    ui.label(f'Done by: {schedule_time.strftime("%a %Y-%m-%d %H:%M")}').classes('text-sm font-mono')
+                                    ui.label(f'Done by: {schedule_time.strftime("%a %d %b %I:%M%p")}').classes('text-sm font-mono')
                                     if mgr.battery_level is not None and mgr.battery_level < 100:
                                         percent_needed = 100 - mgr.battery_level
                                         minutes_needed = _estimate_charge_minutes(percent_needed)
                                         start_time = schedule_time - timedelta(minutes=minutes_needed)
-                                        ui.label(f'Start: {start_time.strftime("%a %H:%M")} ({int(minutes_needed)}min to charge {percent_needed}%)').classes('text-xs text-gray-500')
+                                        ui.label(f'Start: {start_time.strftime("%a %I:%M%p")}').classes('text-xs text-gray-500')
                                     else:
                                         ui.label('Battery full or unknown').classes('text-xs text-gray-400')
 
                                 ui.button(icon='delete', on_click=lambda _, s=sc: (
                                     mgr.scheduled_charges.remove(s),
                                     mgr._save_scheduled_charges(),
-                                    mgr._log(f'Removed schedule for {datetime.fromisoformat(s["time"]).strftime("%a %Y-%m-%d %H:%M")}'),
+                                    mgr._log(f'Removed schedule for {datetime.fromisoformat(s["time"]).strftime("%a %d %b %I:%M%p")}'),
                                 )).props('flat dense size=sm').classes('text-red-600')
 
             log_container.clear()
