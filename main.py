@@ -730,112 +730,7 @@ def build_ui(mgr: TeslaManager):
             mode_desc_label = ui.label('').classes('text-xs sm:text-sm text-gray-600')
             error_label = ui.label('').classes('text-red-600 text-xs sm:text-sm font-medium mt-2')
 
-        # --- Refresh Button ---
-        async def on_refresh():
-            try:
-                await mgr.refresh_state()
-                mgr._log('Manual refresh — data updated')
-            except Exception as e:
-                mgr._log(f'Refresh failed: {e}')
-
-        ui.button('Refresh State', on_click=on_refresh, icon='refresh').classes('w-full bg-gray-700 hover:bg-gray-800')
-
-        # --- Charge to 100% / Schedule Section ---
-        with ui.card().classes('w-full p-3 sm:p-4'):
-            ui.label('Charge to 100%').classes('text-base sm:text-lg font-semibold mb-3')
-
-            async def on_override():
-                try:
-                    mgr.manual_override = True
-                    await mgr.set_charge_limit(WEEKEND_LIMIT)
-                    await mgr.start_charging()
-                    mgr._log('Manual override — charging to 100%')
-                except Exception as e:
-                    mgr._log(f'Override failed: {e}')
-
-            async def on_cancel_override():
-                try:
-                    mgr.manual_override = False
-                    await mgr.set_charge_limit(IDLE_LIMIT)
-                    mgr._log(f'Manual override cancelled, limit set to {IDLE_LIMIT}%')
-                except Exception as e:
-                    mgr._log(f'Cancel override failed: {e}')
-
-            with ui.row().classes('w-full gap-2 sm:gap-3 mb-4'):
-                override_btn = ui.button('Charge Now', on_click=on_override, icon='bolt').classes('flex-1 bg-blue-600 hover:bg-blue-700 text-sm sm:text-base')
-                cancel_btn = ui.button('Cancel Override', on_click=on_cancel_override, icon='close').classes('flex-1 bg-red-600 hover:bg-red-700 text-sm sm:text-base')
-
-            # --- Schedule ---
-            ui.separator()
-            ui.label('Schedule 100% Charge (done by)').classes('text-sm font-medium text-gray-600 mt-3 mb-2')
-            with ui.row().classes('w-full gap-2 items-end'):
-                date_input = ui.input('Date', placeholder='YYYY-MM-DD').classes('flex-1')
-                with date_input:
-                    with ui.menu() as date_menu:
-                        ui.date(on_change=lambda e: (date_input.set_value(e.value), date_menu.close()))
-                    with date_input.add_slot('append'):
-                        ui.icon('edit_calendar').on('click', date_menu.open).classes('cursor-pointer')
-
-                time_input = ui.input('Time').classes('w-28')
-                with time_input:
-                    with ui.menu() as time_menu:
-                        ui.time(value='20:00', on_change=lambda e: (time_input.set_value(e.value), time_menu.close()))
-                    with time_input.add_slot('append'):
-                        ui.icon('access_time').on('click', time_menu.open).classes('cursor-pointer')
-
-                repeat_checkbox = ui.checkbox('Repeat weekly').classes('mb-2')
-
-                async def on_schedule():
-                    try:
-                        t = time_input.value or '20:00'
-                        dt = datetime.strptime(f'{date_input.value} {t}', '%Y-%m-%d %H:%M')
-                        if dt <= datetime.now():
-                            mgr._log('Schedule failed — date/time is in the past')
-                            return
-
-                        # Create schedule with repeat flag
-                        new_schedule = {
-                            "time": dt.isoformat(),
-                            "repeat_weekly": repeat_checkbox.value
-                        }
-                        mgr.scheduled_charges.append(new_schedule)
-                        mgr.scheduled_charges.sort(key=lambda s: s["time"])
-                        mgr._save_scheduled_charges()
-
-                        repeat_text = " (repeating weekly)" if repeat_checkbox.value else ""
-                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %d %b %I:%M%p")}{repeat_text}')
-
-                        date_input.set_value('')
-                        repeat_checkbox.value = False  # Reset checkbox
-
-                        # Check if we need to start charging immediately
-                        time_until = (dt - datetime.now()).total_seconds() / 60
-                        if mgr.battery_level is not None:
-                            # Skip if battery already high enough
-                            if mgr.battery_level >= OVERNIGHT_SKIP:
-                                mgr._log(f'Battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), charge not needed')
-                            else:
-                                percent_needed = 100 - mgr.battery_level
-                                minutes_needed = _estimate_charge_minutes(percent_needed)
-                                if time_until <= minutes_needed:
-                                    await mgr.set_charge_limit(WEEKEND_LIMIT)
-                                    await mgr.start_charging()
-                                    mgr.manual_override = True
-                                    mgr.active_scheduled_charge = new_schedule
-                                    mgr._log(f'Starting now — need {percent_needed}% in {int(time_until)} min')
-                    except ValueError:
-                        mgr._log('Schedule failed — invalid date or time format')
-
-                ui.button('Schedule', on_click=on_schedule, icon='schedule').classes('bg-green-600 hover:bg-green-700')
-
-            schedule_container = ui.column().classes('w-full gap-2 mt-3')
-
-        # --- Action Log ---
-        with ui.card().classes('w-full p-3 sm:p-4'):
-            ui.label('Action Log').classes('text-base sm:text-lg font-semibold mb-3')
-            log_container = ui.column().classes('w-full max-h-60 sm:max-h-80 overflow-y-auto gap-1 p-2 bg-gray-50 rounded border border-gray-200')
-
-        # --- Refresh timer ---
+        # --- Refresh UI function (defined early so handlers can use it) ---
         def refresh_ui():
             batt = mgr.battery_level
             battery_label.text = f'{batt}%' if batt is not None else '--'
@@ -891,17 +786,132 @@ def build_ui(mgr: TeslaManager):
                                     else:
                                         ui.label('Battery full or unknown').classes('text-xs text-gray-400')
 
-                                ui.button(icon='delete', on_click=lambda _, s=sc: (
-                                    mgr.scheduled_charges.remove(s),
-                                    mgr._save_scheduled_charges(),
-                                    mgr._log(f'Removed schedule for {datetime.fromisoformat(s["time"]).strftime("%a %d %b %I:%M%p")}'),
-                                )).props('flat dense size=sm').classes('text-red-600')
+                                def make_delete_handler(s):
+                                    def handler():
+                                        mgr.scheduled_charges.remove(s)
+                                        mgr._save_scheduled_charges()
+                                        mgr._log(f'Removed schedule for {datetime.fromisoformat(s["time"]).strftime("%a %d %b %I:%M%p")}')
+                                        refresh_ui()
+                                    return handler
+
+                                ui.button(icon='delete', on_click=make_delete_handler(sc)).props('flat dense size=sm').classes('text-red-600')
 
             log_container.clear()
             with log_container:
                 for entry in mgr.action_log[:50]:
                     ui.label(entry).classes('text-xs font-mono text-gray-700 leading-relaxed')
 
+        # --- Refresh Button ---
+        async def on_refresh():
+            try:
+                await mgr.refresh_state()
+                mgr._log('Manual refresh — data updated')
+            except Exception as e:
+                mgr._log(f'Refresh failed: {e}')
+            refresh_ui()
+
+        ui.button('Refresh State', on_click=on_refresh, icon='refresh').classes('w-full bg-gray-700 hover:bg-gray-800')
+
+        # --- Charge to 100% / Schedule Section ---
+        with ui.card().classes('w-full p-3 sm:p-4'):
+            ui.label('Charge to 100%').classes('text-base sm:text-lg font-semibold mb-3')
+
+            async def on_override():
+                try:
+                    mgr.manual_override = True
+                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                    await mgr.start_charging()
+                    mgr._log('Manual override — charging to 100%')
+                except Exception as e:
+                    mgr._log(f'Override failed: {e}')
+                refresh_ui()
+
+            async def on_cancel_override():
+                try:
+                    mgr.manual_override = False
+                    await mgr.set_charge_limit(IDLE_LIMIT)
+                    mgr._log(f'Manual override cancelled, limit set to {IDLE_LIMIT}%')
+                except Exception as e:
+                    mgr._log(f'Cancel override failed: {e}')
+                refresh_ui()
+
+            with ui.row().classes('w-full gap-2 sm:gap-3 mb-4'):
+                override_btn = ui.button('Charge Now', on_click=on_override, icon='bolt').classes('flex-1 bg-blue-600 hover:bg-blue-700 text-sm sm:text-base')
+                cancel_btn = ui.button('Cancel Override', on_click=on_cancel_override, icon='close').classes('flex-1 bg-red-600 hover:bg-red-700 text-sm sm:text-base')
+
+            # --- Schedule ---
+            ui.separator()
+            ui.label('Schedule 100% Charge (done by)').classes('text-sm font-medium text-gray-600 mt-3 mb-2')
+            with ui.row().classes('w-full gap-2 items-end'):
+                date_input = ui.input('Date', placeholder='YYYY-MM-DD').classes('flex-1')
+                with date_input:
+                    with ui.menu() as date_menu:
+                        ui.date(on_change=lambda e: (date_input.set_value(e.value), date_menu.close()))
+                    with date_input.add_slot('append'):
+                        ui.icon('edit_calendar').on('click', date_menu.open).classes('cursor-pointer')
+
+                time_input = ui.input('Time').classes('w-28')
+                with time_input:
+                    with ui.menu() as time_menu:
+                        ui.time(value='20:00', on_change=lambda e: (time_input.set_value(e.value), time_menu.close()))
+                    with time_input.add_slot('append'):
+                        ui.icon('access_time').on('click', time_menu.open).classes('cursor-pointer')
+
+                repeat_checkbox = ui.checkbox('Repeat weekly').classes('mb-2')
+
+                async def on_schedule():
+                    try:
+                        t = time_input.value or '20:00'
+                        dt = datetime.strptime(f'{date_input.value} {t}', '%Y-%m-%d %H:%M')
+                        if dt <= datetime.now():
+                            mgr._log('Schedule failed — date/time is in the past')
+                            refresh_ui()
+                            return
+
+                        # Create schedule with repeat flag
+                        new_schedule = {
+                            "time": dt.isoformat(),
+                            "repeat_weekly": repeat_checkbox.value
+                        }
+                        mgr.scheduled_charges.append(new_schedule)
+                        mgr.scheduled_charges.sort(key=lambda s: s["time"])
+                        mgr._save_scheduled_charges()
+
+                        repeat_text = " (repeating weekly)" if repeat_checkbox.value else ""
+                        mgr._log(f'Scheduled: 100% by {dt.strftime("%a %d %b %I:%M%p")}{repeat_text}')
+
+                        date_input.set_value('')
+                        repeat_checkbox.value = False  # Reset checkbox
+
+                        # Check if we need to start charging immediately
+                        time_until = (dt - datetime.now()).total_seconds() / 60
+                        if mgr.battery_level is not None:
+                            # Skip if battery already high enough
+                            if mgr.battery_level >= OVERNIGHT_SKIP:
+                                mgr._log(f'Battery at {mgr.battery_level}% (>= {OVERNIGHT_SKIP}%), charge not needed')
+                            else:
+                                percent_needed = 100 - mgr.battery_level
+                                minutes_needed = _estimate_charge_minutes(percent_needed)
+                                if time_until <= minutes_needed:
+                                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                                    await mgr.start_charging()
+                                    mgr.manual_override = True
+                                    mgr.active_scheduled_charge = new_schedule
+                                    mgr._log(f'Starting now — need {percent_needed}% in {int(time_until)} min')
+                    except ValueError:
+                        mgr._log('Schedule failed — invalid date or time format')
+                    refresh_ui()
+
+                ui.button('Schedule', on_click=on_schedule, icon='schedule').classes('bg-green-600 hover:bg-green-700')
+
+            schedule_container = ui.column().classes('w-full gap-2 mt-3')
+
+        # --- Action Log ---
+        with ui.card().classes('w-full p-3 sm:p-4'):
+            ui.label('Action Log').classes('text-base sm:text-lg font-semibold mb-3')
+            log_container = ui.column().classes('w-full max-h-60 sm:max-h-80 overflow-y-auto gap-1 p-2 bg-gray-50 rounded border border-gray-200')
+
+        # --- Periodic refresh timer (background updates) ---
         timer = ui.timer(30, refresh_ui, active=True)
         async def on_disconnect():
             timer.active = False
