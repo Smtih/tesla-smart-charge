@@ -469,7 +469,8 @@ class TeslaManager:
             self._save_vehicle_state()
             # Show raw telemetry state in logs for debugging
             state_display = self.charge_state
-            if raw_charge_state and self.charge_state != raw_charge_state:
+            # Always show raw value if state is Unknown or if raw differs from normalized
+            if raw_charge_state and (self.charge_state == 'Unknown' or self.charge_state != raw_charge_state):
                 state_display = f'{self.charge_state} (raw: {raw_charge_state})'
             self._log(f'Telemetry — battery {self.battery_level}%, state {state_display}, limit {self.charge_limit}%')
 
