@@ -159,7 +159,7 @@ class TeslaManager:
         self.init_done: bool = False
 
         # State
-        self.battery_level: int | None = None
+        self.battery_level: float | None = None  # Stored with 2 decimal places
         self.charge_state: str = 'Unknown'
         self.charge_state_raw: str | None = None  # Raw telemetry value for debugging
         self.charge_limit: int | None = None
@@ -168,6 +168,7 @@ class TeslaManager:
         self.charge_limit_updated: datetime | None = None
         self._load_vehicle_state()
         self.manual_override: bool = False
+        self.calibration_hold: bool = False  # Keep limit at 100% until unplugged for LFP calibration
         self.action_log: list[str] = []
         self.last_error: str | None = None
         self.scheduled_charges: list[dict] = []  # Each: {"time": str, "repeat_weekly": bool}
@@ -441,6 +442,9 @@ class TeslaManager:
             if self.active_scheduled_charge is not None:
                 return 'Scheduled Charge'
             return 'Manual Override'
+        # Calibration hold (waiting for unplug after 100% charge)
+        if self.calibration_hold:
+            return 'Calibration Hold'
         # Top-Off Guard (runs all week)
         if self.battery_level is not None and self.battery_level < CHARGE_TRIGGER:
             return 'Top-Off Guard - Charging'
@@ -450,9 +454,9 @@ class TeslaManager:
         """Apply streamed telemetry fields to local state."""
         now = datetime.now()
         changed = False
-        soc = fields.get('BatteryLevel') or fields.get('Soc')
-        if soc is not None:
-            new_level = int(float(soc))
+        raw_soc = fields.get('BatteryLevel') or fields.get('Soc')
+        if raw_soc is not None:
+            new_level = round(float(raw_soc), 2)
             if new_level != self.battery_level:
                 self.battery_level = new_level
                 changed = True
@@ -471,8 +475,8 @@ class TeslaManager:
             self._save_vehicle_state()
             # Log exactly what data we received (not inferred values)
             parts = []
-            if soc is not None:
-                parts.append(f'battery {self.battery_level}%')
+            if raw_soc is not None:
+                parts.append(f'battery {raw_soc}%')
             if raw_charge_state is not None:
                 if raw_charge_state != self.charge_state:
                     parts.append(f'state {self.charge_state} (raw: {raw_charge_state})')
@@ -560,6 +564,11 @@ async def charge_loop(mgr: TeslaManager):
                     mgr.manual_override = False
                     mgr._log('Unplugged during manual override — reverting to automatic mode')
 
+                # Clear calibration hold when unplugged (LFP calibration complete)
+                if mgr.calibration_hold:
+                    mgr.calibration_hold = False
+                    mgr._log('Unplugged — LFP calibration hold released')
+
                 # Set appropriate charge limit based on battery level
                 if mgr.battery_level is not None and mgr.battery_level >= CHARGE_TRIGGER:
                     if mgr.charge_limit is not None and mgr.charge_limit != IDLE_LIMIT:
@@ -626,14 +635,15 @@ async def charge_loop(mgr: TeslaManager):
 
                         mgr.active_scheduled_charge = None
 
-                    # Reset to idle limit
-                    await mgr.set_charge_limit(IDLE_LIMIT)
+                    # Keep limit at 100% until unplugged for LFP battery calibration
                     mgr.manual_override = False
-                    mgr._log(f'Charge complete — battery at 100%, limit set to {IDLE_LIMIT}%')
+                    mgr.calibration_hold = True
+                    mgr._log(f'Charge complete — battery at 100%, holding limit for LFP calibration until unplugged')
                 # No logging while override is active — telemetry already logs updates
 
             # --- Rule 2: Top-Off Guard (runs 7 days a week) ---
-            elif not mgr.manual_override:
+            # Skip if in calibration hold (waiting for unplug after 100% charge)
+            elif not mgr.manual_override and not mgr.calibration_hold:
                 if mgr.battery_level >= NO_CHARGE_ABOVE:
                     if mgr.charge_limit != IDLE_LIMIT:
                         await mgr.set_charge_limit(IDLE_LIMIT)
@@ -664,8 +674,9 @@ def build_auth_ui(mgr: TeslaManager):
 # ---------------------------------------------------------------------------
 MODE_DESCRIPTIONS = {
     'Not Authenticated': 'Sign in to connect your Tesla account',
-    'Manual Override': f'Charging to {WEEKEND_LIMIT}% — user initiated. Will reset to {IDLE_LIMIT}% when battery reaches 100%.',
-    'Scheduled Charge': f'Charging to {WEEKEND_LIMIT}% for scheduled time. Will reset to {IDLE_LIMIT}% when complete. Skips if battery ≥{OVERNIGHT_SKIP}%.',
+    'Manual Override': f'Charging to {WEEKEND_LIMIT}% — user initiated. Limit stays at 100% until unplugged for LFP calibration.',
+    'Scheduled Charge': f'Charging to {WEEKEND_LIMIT}% for scheduled time. Limit stays at 100% until unplugged. Skips if battery ≥{OVERNIGHT_SKIP}%.',
+    'Calibration Hold': f'Battery at 100% — holding limit for LFP calibration. Will reset to {IDLE_LIMIT}% when unplugged.',
     'Top-Off Guard': f'Protecting battery from shallow cycles. Charge limit at {IDLE_LIMIT}% until battery drops below {CHARGE_TRIGGER}%.',
     'Top-Off Guard - Charging': f'Battery below {CHARGE_TRIGGER}% — limit raised to {WEEKDAY_LIMIT}% for one full charge session.',
 }
@@ -742,7 +753,7 @@ def build_ui(mgr: TeslaManager):
         # --- Refresh UI function (defined early so handlers can use it) ---
         def refresh_ui():
             batt = mgr.battery_level
-            battery_label.text = f'{batt}%' if batt is not None else '--'
+            battery_label.text = f'{batt:.2f}%' if batt is not None else '--'
             if batt is not None and batt < 100:
                 percent_needed = 100 - batt
                 minutes_needed = _estimate_charge_minutes(percent_needed)
