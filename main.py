@@ -616,11 +616,14 @@ async def charge_loop(mgr: TeslaManager):
                             minutes_needed = _estimate_charge_minutes(percent_needed)
 
                             if time_until <= minutes_needed:
-                                await mgr.set_charge_limit(WEEKEND_LIMIT)
-                                await mgr.start_charging()
-                                mgr.manual_override = True
-                                mgr.active_scheduled_charge = next_schedule
-                                mgr._log(f'Scheduled charge started — need {percent_needed}% (~{int(minutes_needed)} min) in {int(time_until)} min, done by {next_time.strftime("%a %I:%M%p")}')
+                                try:
+                                    await mgr.set_charge_limit(WEEKEND_LIMIT)
+                                    await mgr.start_charging()
+                                    mgr.manual_override = True
+                                    mgr.active_scheduled_charge = next_schedule
+                                    mgr._log(f'Scheduled charge started — need {percent_needed}% (~{int(minutes_needed)} min) in {int(time_until)} min, done by {next_time.strftime("%a %I:%M%p")}')
+                                except Exception as e:
+                                    mgr._log(f'Scheduled charge failed (will retry): {e}')
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
