@@ -115,12 +115,14 @@ TOKEN_FILE = Path(__file__).parent / 'token.json'
 STATE_FILE = Path(__file__).parent / 'vehicle_state.json'
 
 LOG_FILE = Path(__file__).parent / 'smart-charge.log'
+# Use WatchedFileHandler instead of RotatingFileHandler to avoid issues with
+# Docker bind mounts (OSError: Device or resource busy on rename)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3),
+        logging.handlers.WatchedFileHandler(LOG_FILE),
     ],
 )
 log = logging.getLogger(__name__)
@@ -587,7 +589,18 @@ async def charge_loop(mgr: TeslaManager):
 
                 # Remove if scheduled time has passed
                 if time_until < 0:
-                    mgr._log(f'Scheduled charge time passed ({next_time.strftime("%a %I:%M%p")}) — removing from schedule')
+                    # If it's a repeating schedule, create the next instance before removing
+                    if next_schedule.get("repeat_weekly", False):
+                        next_instance_time = next_time + timedelta(days=7)
+                        new_schedule = {
+                            "time": next_instance_time.isoformat(),
+                            "repeat_weekly": True
+                        }
+                        mgr.scheduled_charges.append(new_schedule)
+                        mgr.scheduled_charges.sort(key=lambda s: s["time"])
+                        mgr._log(f'Missed schedule ({next_time.strftime("%a %I:%M%p")}) — created next weekly instance for {next_instance_time.strftime("%a %I:%M%p")}')
+                    else:
+                        mgr._log(f'Scheduled charge time passed ({next_time.strftime("%a %I:%M%p")}) — removing from schedule')
                     mgr.scheduled_charges.pop(0)
                     mgr._save_scheduled_charges()
                 else:
