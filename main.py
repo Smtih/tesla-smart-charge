@@ -39,7 +39,7 @@ OVERNIGHT_SKIP = 90       # Skip overnight 100% charge if SOC is already above t
 # ---------------------------------------------------------------------------
 # Tesla telemetry sends DetailedChargeState values like:
 #   Disconnected, NoPower, Starting, Charging, Complete, Stopped, Unknown
-# But also non-standard values like: Idle, ClearFaults
+# But also non-standard values like: Idle, ClearFaults, Shutdown, Enable
 # We consolidate to 3 user-friendly states: Unplugged, Plugged, Charging
 CHARGE_STATE_MAP = {
     # Unplugged - cable not connected
@@ -51,10 +51,13 @@ CHARGE_STATE_MAP = {
     'DetailedChargeStateCharging': 'Charging',
     'Starting': 'Charging',
     'DetailedChargeStateStarting': 'Charging',
+    'Enable': 'Charging',  # Telemetry value for actively charging
+    'WaitForLineVoltage': 'Charging',  # Starting up charger
 
-    # Plugged - connected but not actively charging
+    # Plugged - connected but not actively charging (finished, stopped, idle, etc.)
     'Complete': 'Plugged',
     'DetailedChargeStateComplete': 'Plugged',
+    'Shutdown': 'Plugged',  # Telemetry value when charging finishes
     'Stopped': 'Plugged',
     'DetailedChargeStateStopped': 'Plugged',
     'NoPower': 'Plugged',
@@ -627,13 +630,10 @@ async def charge_loop(mgr: TeslaManager):
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
-                # Detect charge complete: battery >= 99% and not actively charging
-                # Tesla reports "full" at 99.x%, never exactly 100%
-                charge_complete = (
-                    mgr.battery_level is not None and
-                    mgr.battery_level >= 99 and
-                    mgr.charge_state == 'Plugged'  # Plugged but not Charging = Complete
-                )
+                # Detect charge complete: state changed from Charging to Plugged
+                # This means the car stopped charging (reached limit or finished)
+                # We don't check battery % - let the car decide when it's done
+                charge_complete = mgr.charge_state == 'Plugged'
 
                 # Also clear scheduled charge if we've passed the target time
                 schedule_time_passed = False
