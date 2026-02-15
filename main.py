@@ -627,15 +627,29 @@ async def charge_loop(mgr: TeslaManager):
 
             # --- Rule 1: Manual Override / Scheduled Charge Completion ---
             if mgr.manual_override:
-                if mgr.battery_level is not None and mgr.battery_level >= 100:
+                # Detect charge complete: battery >= 99% and not actively charging
+                # Tesla reports "full" at 99.x%, never exactly 100%
+                charge_complete = (
+                    mgr.battery_level is not None and
+                    mgr.battery_level >= 99 and
+                    mgr.charge_state == 'Plugged'  # Plugged but not Charging = Complete
+                )
+
+                # Also clear scheduled charge if we've passed the target time
+                schedule_time_passed = False
+                if mgr.active_scheduled_charge:
+                    schedule_time = datetime.fromisoformat(mgr.active_scheduled_charge["time"])
+                    schedule_time_passed = now > schedule_time
+
+                if charge_complete or schedule_time_passed:
                     # Check if this was a scheduled charge
                     if mgr.active_scheduled_charge:
                         schedule = mgr.active_scheduled_charge
-                        schedule_time = datetime.fromisoformat(schedule["time"])
 
                         # If it's a repeating schedule, create next instance
                         if schedule.get("repeat_weekly", False):
-                            next_time = schedule_time + timedelta(days=7)
+                            schedule_dt = datetime.fromisoformat(schedule["time"])
+                            next_time = schedule_dt + timedelta(days=7)
                             new_schedule = {
                                 "time": next_time.isoformat(),
                                 "repeat_weekly": True
@@ -654,7 +668,8 @@ async def charge_loop(mgr: TeslaManager):
                     # Keep limit at 100% until unplugged for LFP battery calibration
                     mgr.manual_override = False
                     mgr.calibration_hold = True
-                    mgr._log(f'Charge complete — battery at 100%, holding limit for LFP calibration until unplugged')
+                    status = "complete" if charge_complete else f"schedule time passed ({schedule_time.strftime('%I:%M%p')})"
+                    mgr._log(f'Charge {status} — battery at {mgr.battery_level:.1f}%, holding limit for LFP calibration until unplugged')
                 # No logging while override is active — telemetry already logs updates
 
             # --- Rule 2: Top-Off Guard (runs 7 days a week) ---
